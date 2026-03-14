@@ -62,6 +62,44 @@ function AnalyzeContent() {
   const [showPanorama, setShowPanorama] = useState(true);
   const lastFetchedUrl = useRef('');
   const fetchIdRef = useRef(0);
+  const defaultGeminiApiVersion = "v1beta";
+
+  const resolveGeminiEndpoint = () => {
+    const rawBaseUrl =
+      process.env.NEXT_PUBLIC_GEMINI_BASE_URL ||
+      process.env.GEMINI_BASE_URL ||
+      "https://generativelanguage.googleapis.com";
+
+    const trimmed = rawBaseUrl.replace(/\/+$/, "");
+    const match = trimmed.match(/\/(v1beta|v1)$/i);
+    const apiVersion = match ? match[1].toLowerCase() : defaultGeminiApiVersion;
+    const baseUrl = match ? trimmed.slice(0, -match[0].length) : trimmed;
+    const requestUrl = `${baseUrl}/${apiVersion}`;
+    return { rawBaseUrl, baseUrl, apiVersion, requestUrl };
+  };
+
+  const createGeminiClient = () => {
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    if (!apiKey) return null;
+
+    const endpoint = resolveGeminiEndpoint();
+    return new GoogleGenAI(
+      endpoint.baseUrl
+        ? {
+            apiKey,
+            httpOptions: {
+              baseUrl: endpoint.baseUrl,
+              apiVersion: endpoint.apiVersion,
+            },
+          }
+        : {
+            apiKey,
+            httpOptions: {
+              apiVersion: endpoint.apiVersion,
+            },
+          }
+    );
+  };
 
   const addLog = (message: LocalizedString, type: LogEntry['type'] = 'info', details?: any) => {
     setLogs(prev => [...prev, {
@@ -107,9 +145,8 @@ function AnalyzeContent() {
     addLog({ en: 'Starting sub-function analysis...', zh: '开始分析子函数...' }, 'info');
 
     try {
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) return;
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = createGeminiClient();
+      if (!ai) return;
 
       // Fetch entry file content
       const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${entryFilePath}`;
@@ -143,6 +180,9 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
       addLog({ en: 'Analyzing sub-functions with AI...', zh: '正在使用 AI 分析子函数...' }, 'info', {
         request: {
           model: "gemini-3-flash-preview",
+          baseUrl: resolveGeminiEndpoint().baseUrl,
+          apiVersion: resolveGeminiEndpoint().apiVersion,
+          url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
           prompt: prompt
         }
       });
@@ -197,9 +237,8 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
     setIsVerifyingEntry(true);
     
     try {
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) return;
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = createGeminiClient();
+      if (!ai) return;
 
       for (const filePath of analysisResult.entryFiles) {
         if (currentFetchId !== fetchIdRef.current) return;
@@ -243,6 +282,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
           addLog({ en: `AI Request Payload for ${filePath}`, zh: `${filePath} 的 AI 请求数据` }, 'info', { 
             request: { 
               model: "gemini-3-flash-preview", 
+              baseUrl: resolveGeminiEndpoint().baseUrl,
+              apiVersion: resolveGeminiEndpoint().apiVersion,
+              url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
               promptLength: prompt.length,
               prompt: prompt
             } 
@@ -306,13 +348,12 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setConfirmedEntryFile(null);
     addLog({ en: 'Starting AI analysis...', zh: '开始 AI 分析...' }, 'info');
     try {
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) {
+      const ai = createGeminiClient();
+      if (!ai) {
         console.warn("Gemini API key not found");
         addLog({ en: 'Gemini API key not found.', zh: '未找到 Gemini API 密钥。' }, 'error');
         return;
       }
-      const ai = new GoogleGenAI({ apiKey });
       
       // Limit to 2000 files to avoid excessive token usage
       const pathsToAnalyze = filePaths.slice(0, 2000).join('\n');
@@ -322,6 +363,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       addLog({ en: 'AI Request Payload', zh: 'AI 请求数据' }, 'info', { 
         request: { 
           model: "gemini-3.1-pro-preview", 
+          baseUrl: resolveGeminiEndpoint().baseUrl,
+          apiVersion: resolveGeminiEndpoint().apiVersion,
+          url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
           promptLength: prompt.length,
           filesCount: filePaths.slice(0, 2000).length,
           prompt: prompt
@@ -682,7 +726,19 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                             <div className="ml-6 mr-2 mb-2 mt-1 p-2 bg-slate-950 rounded border border-slate-800 overflow-x-auto">
                               {log.details.request?.prompt ? (
                                 <div className="space-y-2">
-                                  <div className="text-indigo-400 font-semibold text-xs">Request:</div>
+                                  <div className="text-indigo-400 font-semibold text-xs">Request Meta:</div>
+                                  <pre className="text-slate-400 text-[10px] whitespace-pre-wrap">
+                                    {JSON.stringify(
+                                      truncateLongStrings(
+                                        Object.fromEntries(
+                                          Object.entries(log.details.request).filter(([key]) => key !== 'prompt')
+                                        )
+                                      ),
+                                      null,
+                                      2
+                                    )}
+                                  </pre>
+                                  <div className="text-indigo-400 font-semibold text-xs">Request Prompt:</div>
                                   <pre className="text-slate-400 text-[10px] whitespace-pre-wrap font-mono bg-slate-900 p-2 rounded border border-slate-800">
                                     {log.details.request.prompt}
                                   </pre>
@@ -954,7 +1010,19 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                   <div className="ml-8 mr-4 mb-4 mt-2 p-4 bg-slate-950 rounded-lg border border-slate-800 overflow-x-auto">
                     {log.details.request?.prompt ? (
                       <div className="space-y-3">
-                        <div className="text-indigo-400 font-semibold text-sm">Request:</div>
+                        <div className="text-indigo-400 font-semibold text-sm">Request Meta:</div>
+                        <pre className="text-slate-400 text-xs leading-relaxed whitespace-pre-wrap">
+                          {JSON.stringify(
+                            truncateLongStrings(
+                              Object.fromEntries(
+                                Object.entries(log.details.request).filter(([key]) => key !== 'prompt')
+                              )
+                            ),
+                            null,
+                            2
+                          )}
+                        </pre>
+                        <div className="text-indigo-400 font-semibold text-sm">Request Prompt:</div>
                         <pre className="text-slate-400 text-xs leading-relaxed font-mono bg-slate-900 p-3 rounded border border-slate-800 whitespace-pre-wrap">
                           {log.details.request.prompt}
                         </pre>
