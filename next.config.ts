@@ -5,6 +5,7 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_GEMINI_API_KEY: process.env.GEMINI_API_KEY,
     NEXT_PUBLIC_GEMINI_BASE_URL: process.env.GEMINI_BASE_URL,
+    NEXT_PUBLIC_GITHUB_TOKEN: process.env.GITHUB_TOKEN,
   },
   eslint: {
     ignoreDuringBuilds: true,

@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import { useState, useEffect, Suspense, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
@@ -20,6 +20,43 @@ type LogEntry = {
   message: LocalizedString;
   details?: any;
   expanded?: boolean;
+};
+
+type RepoRef = { owner: string; repo: string; branch: string };
+type GithubEndpointKind = 'api' | 'raw';
+
+class GithubRequestError extends Error {
+  details: Record<string, any>;
+
+  constructor(message: string, details: Record<string, any>) {
+    super(message);
+    this.name = 'GithubRequestError';
+    this.details = details;
+  }
+}
+
+type SubFunctionNode = {
+  id: string;
+  parentId: string;
+  depth: number;
+  name: string;
+  file: string;
+  description_en: string;
+  description_zh: string;
+  drillDown: number;
+};
+
+type LocatedFunction = {
+  file: string;
+  code: string;
+  lineStart: number;
+  lineEnd: number;
+};
+
+type FunctionNameNormalization = {
+  original: string;
+  normalized: string;
+  candidates: string[];
 };
 
 function AnalyzeContent() {
@@ -138,6 +175,527 @@ function AnalyzeContent() {
     return obj;
   };
 
+  const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
+
+  const getGithubTokenMeta = () => {
+    const token = getGithubToken();
+    if (!token) {
+      return { configured: false, masked: null, length: 0 };
+    }
+
+    const head = token.slice(0, 4);
+    const tail = token.slice(-4);
+    return {
+      configured: true,
+      masked: `${head}...${tail}`,
+      length: token.length,
+    };
+  };
+
+  const getGithubApiHeaders = () => {
+    const token = getGithubToken();
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+  };
+
+  const toErrorMessage = (error: unknown) => {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    return 'Unknown error';
+  };
+
+  const getGithubHintByStatus = (status: number, endpoint: GithubEndpointKind) => {
+    if (status === 401) return 'GitHub token invalid/expired. Please regenerate token.';
+    if (status === 403) return 'Possible API rate limit or token permissions issue.';
+    if (status === 404) {
+      if (endpoint === 'raw') return 'File/branch may not exist in raw endpoint, or repository is private.';
+      return 'Repository/file not found, or token has no access to private repository.';
+    }
+    if (status === 429) return 'GitHub rate limit exceeded.';
+    if (status >= 500) return 'GitHub service temporary issue.';
+    return 'See response body snippet and request metadata for diagnosis.';
+  };
+
+  const decodeBase64Utf8 = (base64: string) => {
+    const normalized = base64.replace(/\n/g, '');
+    const binary = atob(normalized);
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  };
+
+  const buildGithubErrorFromResponse = async (res: Response, context: {
+    endpoint: GithubEndpointKind;
+    operation: string;
+    url: string;
+    filePath?: string;
+    owner?: string;
+    repo?: string;
+    branch?: string;
+  }) => {
+    const bodyText = await res.text().catch(() => '');
+    const details = {
+      endpoint: context.endpoint,
+      operation: context.operation,
+      url: context.url,
+      owner: context.owner,
+      repo: context.repo,
+      branch: context.branch,
+      filePath: context.filePath,
+      status: res.status,
+      statusText: res.statusText,
+      rateLimit: {
+        limit: res.headers.get('x-ratelimit-limit'),
+        remaining: res.headers.get('x-ratelimit-remaining'),
+        reset: res.headers.get('x-ratelimit-reset'),
+      },
+      responseSnippet: bodyText.slice(0, 500),
+      token: {
+        ...getGithubTokenMeta(),
+        isExposedToBrowser: Boolean(process.env.NEXT_PUBLIC_GITHUB_TOKEN),
+      },
+      hint: getGithubHintByStatus(res.status, context.endpoint),
+    };
+    throw new GithubRequestError(
+      `${context.operation} failed: HTTP ${res.status} ${res.statusText}`,
+      details
+    );
+  };
+
+  const buildGithubErrorFromException = (
+    err: unknown,
+    context: {
+      endpoint: GithubEndpointKind;
+      operation: string;
+      url: string;
+      filePath?: string;
+      owner?: string;
+      repo?: string;
+      branch?: string;
+    }
+  ) => {
+    const errObj = err as any;
+    const details = {
+      endpoint: context.endpoint,
+      operation: context.operation,
+      url: context.url,
+      owner: context.owner,
+      repo: context.repo,
+      branch: context.branch,
+      filePath: context.filePath,
+      errorName: errObj?.name || 'Error',
+      errorMessage: toErrorMessage(err),
+      token: {
+        ...getGithubTokenMeta(),
+        isExposedToBrowser: Boolean(process.env.NEXT_PUBLIC_GITHUB_TOKEN),
+      },
+      hint:
+        context.endpoint === 'raw'
+          ? 'Network/CORS issue when accessing raw.githubusercontent.com from browser. Check proxy/firewall, and avoid Authorization header on raw requests.'
+          : 'Network issue when accessing api.github.com. Check connectivity/proxy/firewall.',
+    };
+
+    throw new GithubRequestError(`${context.operation} failed: ${toErrorMessage(err)}`, details);
+  };
+
+  const fetchGithubApiJson = async <T,>(url: string, operation: string): Promise<T> => {
+    try {
+      const res = await fetch(url, { headers: getGithubApiHeaders() });
+      if (!res.ok) {
+        await buildGithubErrorFromResponse(res, { endpoint: 'api', operation, url });
+      }
+      return res.json() as Promise<T>;
+    } catch (err) {
+      if (err instanceof GithubRequestError) throw err;
+      buildGithubErrorFromException(err, { endpoint: 'api', operation, url });
+    }
+  };
+
+  const logGithubError = (scope: string, err: unknown, filePath?: string) => {
+    if (err instanceof GithubRequestError) {
+      const name = filePath ? `${scope} ${filePath}` : scope;
+      addLog(
+        {
+          en: `${name} failed: ${err.message}`,
+          zh: `${name} 失败: ${err.message}`,
+        },
+        'error',
+        { githubError: err.details }
+      );
+      return;
+    }
+
+    const msg = toErrorMessage(err);
+    const name = filePath ? `${scope} ${filePath}` : scope;
+    addLog(
+      {
+        en: `${name} failed: ${msg}`,
+        zh: `${name} 失败: ${msg}`,
+      },
+      'error'
+    );
+  };
+
+  const getMaxDrillDownDepth = () => {
+    const raw =
+      process.env.NEXT_PUBLIC_GEMINI_DRILLDOWN_MAX_DEPTH ||
+      process.env.GEMINI_DRILLDOWN_MAX_DEPTH ||
+      '2';
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return 2;
+    return Math.min(Math.max(parsed, 0), 6);
+  };
+
+  const fetchFileText = async (repo: RepoRef, filePath: string) => {
+    const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${filePath}`;
+
+    try {
+      // Avoid Authorization on raw endpoint to reduce browser preflight/CORS failures.
+      const rawRes = await fetch(rawUrl);
+      if (rawRes.ok) {
+        return { text: await rawRes.text(), rawUrl, source: 'raw' as const };
+      }
+      if (rawRes.status !== 404) {
+        await buildGithubErrorFromResponse(rawRes, {
+          endpoint: 'raw',
+          operation: 'Fetch raw file',
+          url: rawUrl,
+          owner: repo.owner,
+          repo: repo.repo,
+          branch: repo.branch,
+          filePath,
+        });
+      }
+    } catch (rawErr) {
+      const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(repo.branch)}`;
+      try {
+        const apiRes = await fetch(apiUrl, { headers: getGithubApiHeaders() });
+        if (!apiRes.ok) {
+          await buildGithubErrorFromResponse(apiRes, {
+            endpoint: 'api',
+            operation: 'Fetch file content via GitHub contents API',
+            url: apiUrl,
+            owner: repo.owner,
+            repo: repo.repo,
+            branch: repo.branch,
+            filePath,
+          });
+        }
+        const payload = await apiRes.json();
+        if (!payload?.content || payload?.encoding !== 'base64') {
+          throw new GithubRequestError('Unexpected contents API payload', {
+            endpoint: 'api',
+            operation: 'Decode contents API response',
+            url: apiUrl,
+            owner: repo.owner,
+            repo: repo.repo,
+            branch: repo.branch,
+            filePath,
+            payloadShape: {
+              hasContent: Boolean(payload?.content),
+              encoding: payload?.encoding,
+              type: payload?.type,
+            },
+          });
+        }
+        return {
+          text: decodeBase64Utf8(payload.content),
+          rawUrl,
+          source: 'api' as const,
+        };
+      } catch (apiErr) {
+        if (apiErr instanceof GithubRequestError) throw apiErr;
+        buildGithubErrorFromException(apiErr, {
+          endpoint: 'api',
+          operation: 'Fetch file content via GitHub contents API',
+          url: apiUrl,
+          owner: repo.owner,
+          repo: repo.repo,
+          branch: repo.branch,
+          filePath,
+        });
+      }
+    }
+
+    const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(repo.branch)}`;
+    const apiRes = await fetch(apiUrl, { headers: getGithubApiHeaders() });
+    if (!apiRes.ok) {
+      await buildGithubErrorFromResponse(apiRes, {
+        endpoint: 'api',
+        operation: 'Fetch file content via GitHub contents API',
+        url: apiUrl,
+        owner: repo.owner,
+        repo: repo.repo,
+        branch: repo.branch,
+        filePath,
+      });
+    }
+    const payload = await apiRes.json();
+    if (!payload?.content || payload?.encoding !== 'base64') {
+      throw new GithubRequestError('Unexpected contents API payload', {
+        endpoint: 'api',
+        operation: 'Decode contents API response',
+        url: apiUrl,
+        owner: repo.owner,
+        repo: repo.repo,
+        branch: repo.branch,
+        filePath,
+        payloadShape: {
+          hasContent: Boolean(payload?.content),
+          encoding: payload?.encoding,
+          type: payload?.type,
+        },
+      });
+    }
+
+    return {
+      text: decodeBase64Utf8(payload.content),
+      rawUrl,
+      source: 'api' as const,
+    };
+  };
+
+  const isLikelySystemOrLibraryFunction = (name: string) => {
+    const n = name.trim().toLowerCase();
+    if (!n) return true;
+    const deny = new Set([
+      'render',
+      'constructor',
+      'componentdidmount',
+      'componentdidupdate',
+      'componentwillunmount',
+      'main',
+      'init',
+      'setup',
+      'teardown',
+      'close',
+      'open',
+      'map',
+      'filter',
+      'reduce',
+      'forEach',
+      'then',
+      'catch',
+      'finally',
+      'setstate',
+      'useeffect',
+      'usestate',
+    ]);
+    if (deny.has(n)) return true;
+    if (/^(get|set|is)[A-Z_]/.test(name)) return false;
+    return n.length <= 2;
+  };
+
+  const normalizeCalledFunctionName = (input: string): FunctionNameNormalization => {
+    const original = (input || '').trim();
+    if (!original) {
+      return {
+        original,
+        normalized: '',
+        candidates: [],
+      };
+    }
+
+    let value = original
+      .replace(/\s+/g, ' ')
+      .replace(/^[*&\s]+/, '')
+      .replace(/^(?:await|new)\s+/i, '')
+      .replace(/\(.*$/, '')
+      .replace(/[;,\s]+$/, '')
+      .trim();
+
+    if (!value) {
+      return {
+        original,
+        normalized: '',
+        candidates: [],
+      };
+    }
+
+    const byArrow = value.split('->').pop() || value;
+    const byDot = byArrow.split('.').pop() || byArrow;
+    const byScope = byDot.split('::').pop() || byDot;
+    const cleaned = byScope
+      .replace(/<[^<>]*>/g, '')
+      .replace(/\[.*\]$/, '')
+      .replace(/^['"`]|['"`]$/g, '')
+      .trim();
+
+    const candidates = Array.from(
+      new Set(
+        [cleaned, byScope.trim(), byDot.trim(), byArrow.trim(), value.trim(), original]
+          .filter(Boolean)
+      )
+    );
+
+    return {
+      original,
+      normalized: cleaned || byScope || value,
+      candidates,
+    };
+  };
+
+  const buildFunctionDefinitionRegexes = (fnName: string) => {
+    const escaped = fnName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return [
+      new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`, 'm'),
+      new RegExp(`\\b(?:const|let|var)\\s+${escaped}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
+      new RegExp(`\\b${escaped}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
+      new RegExp(`\\b(?:public|private|protected|static|async|export\\s+)*${escaped}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
+      new RegExp(`\\bdef\\s+${escaped}\\s*\\(`, 'm'),
+      new RegExp(`\\b(?:func|fn)\\s+${escaped}\\s*\\(`, 'm'),
+      new RegExp(`\\b${escaped}\\s*:\\s*function\\s*\\(`, 'm'),
+      new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
+      // C/C++ free function definition with return type/qualifiers.
+      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b${escaped}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
+      // C++ class/namespace scoped definition: ClassName::method(...)
+      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b[\\w:<>~]+::${escaped}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
+    ];
+  };
+
+  const extractFunctionSnippet = (fileText: string, matchIndex: number) => {
+    const lines = fileText.split('\n');
+    let charCount = 0;
+    let startLine = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const lineLen = lines[i].length + 1;
+      if (charCount + lineLen > matchIndex) {
+        startLine = i;
+        break;
+      }
+      charCount += lineLen;
+    }
+
+    let endLine = Math.min(lines.length - 1, startLine + 220);
+    let braceBalance = 0;
+    let seenOpening = false;
+    for (let i = startLine; i <= endLine; i++) {
+      const line = lines[i];
+      for (const ch of line) {
+        if (ch === '{') {
+          braceBalance++;
+          seenOpening = true;
+        } else if (ch === '}') {
+          braceBalance--;
+        }
+      }
+      if (seenOpening && braceBalance <= 0 && i > startLine) {
+        endLine = i;
+        break;
+      }
+    }
+
+    const snippet = lines.slice(startLine, endLine + 1).join('\n');
+    return {
+      code: snippet,
+      lineStart: startLine + 1,
+      lineEnd: endLine + 1,
+    };
+  };
+
+  const findFunctionInFile = (fileText: string, fnName: string): LocatedFunction | null => {
+    const normalized = normalizeCalledFunctionName(fnName);
+    for (const nameCandidate of normalized.candidates) {
+      const regexes = buildFunctionDefinitionRegexes(nameCandidate);
+      for (const re of regexes) {
+        const match = re.exec(fileText);
+        if (match?.index !== undefined) {
+          const snippet = extractFunctionSnippet(fileText, match.index);
+          return {
+            file: '',
+            code: snippet.code,
+            lineStart: snippet.lineStart,
+            lineEnd: snippet.lineEnd,
+          };
+        }
+      }
+    }
+    return null;
+  };
+
+  const locateFunctionDefinition = async ({
+    functionName,
+    parentFile,
+    allFiles,
+    repo,
+    ai,
+    currentFetchId,
+  }: {
+    functionName: string;
+    parentFile: string;
+    allFiles: string[];
+    repo: RepoRef;
+    ai: GoogleGenAI;
+    currentFetchId: number;
+  }): Promise<LocatedFunction | null> => {
+    if (currentFetchId !== fetchIdRef.current) return null;
+
+    // Stage 1: same file as parent caller
+    if (parentFile) {
+      const parentFileContent = await fetchFileText(repo, parentFile);
+      if (parentFileContent) {
+        const inParent = findFunctionInFile(parentFileContent.text, functionName);
+        if (inParent) {
+          return { ...inParent, file: parentFile };
+        }
+      }
+    }
+
+    // Stage 2: let AI guess likely files from file list
+    const fileList = allFiles.slice(0, 2000).join('\n');
+    const guessPrompt = `Given a repository file list and a function name, return up to 8 likely file paths where the function is defined.
+Function: ${normalizeCalledFunctionName(functionName).normalized || functionName}
+Parent file: ${parentFile}
+Files:
+${fileList}`;
+
+    try {
+      const guessResp = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: guessPrompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              candidateFiles: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+            },
+            required: ["candidateFiles"],
+          },
+        },
+      });
+
+      if (guessResp.text) {
+        const guessed = JSON.parse(guessResp.text)?.candidateFiles || [];
+        for (const file of guessed) {
+          if (currentFetchId !== fetchIdRef.current) return null;
+          const content = await fetchFileText(repo, file);
+          if (!content) continue;
+          const found = findFunctionInFile(content.text, functionName);
+          if (found) return { ...found, file };
+        }
+      }
+    } catch {
+      // Continue to stage 3 on any AI-guess failure.
+    }
+
+    // Stage 3: regex search across project files
+    for (const file of allFiles) {
+      if (currentFetchId !== fetchIdRef.current) return null;
+      const content = await fetchFileText(repo, file);
+      if (!content) continue;
+      const found = findFunctionInFile(content.text, functionName);
+      if (found) return { ...found, file };
+    }
+
+    return null;
+  };
+
   const analyzeSubFunctions = async (entryFilePath: string, currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string, projectSummary: string, allFiles: string[]) => {
     if (currentFetchId !== fetchIdRef.current) return;
     setIsAnalyzingSubFunctions(true);
@@ -149,10 +707,11 @@ function AnalyzeContent() {
       if (!ai) return;
 
       // Fetch entry file content
-      const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${entryFilePath}`;
-      const res = await fetch(rawUrl);
-      if (!res.ok) throw new Error('Failed to fetch entry file content');
-      const text = await res.text();
+      const entryContent = await fetchFileText(repo, entryFilePath);
+      if (!entryContent) {
+        throw new Error('Entry file content is empty');
+      }
+      const text = entryContent.text;
       
       const fileList = allFiles.slice(0, 1000).join('\n');
       
@@ -220,7 +779,11 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
       if (response.text) {
         const result = JSON.parse(response.text);
         setSubFunctions(result.subFunctions || []);
-        addLog({ en: `Found ${result.subFunctions?.length || 0} sub-functions.`, zh: `找到 ${result.subFunctions?.length || 0} 个子函数。` }, 'success', { result });
+        addLog(
+          { en: `Found ${result.subFunctions?.length || 0} sub-functions.`, zh: `找到 ${result.subFunctions?.length || 0} 个子函数。` },
+          'success',
+          { result }
+        );
       }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
@@ -232,30 +795,238 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
     }
   };
 
+  const analyzeSubFunctionsRecursive = async (
+    entryFilePath: string,
+    currentFetchId: number,
+    repo: RepoRef,
+    targetUrl: string,
+    projectSummary: string,
+    allFiles: string[]
+  ) => {
+    if (currentFetchId !== fetchIdRef.current) return;
+    setIsAnalyzingSubFunctions(true);
+    setSubFunctions([]);
+    addLog(
+      { en: 'Starting recursive sub-function analysis...', zh: '开始递归分析子函数...' },
+      'info'
+    );
+
+    try {
+      const ai = createGeminiClient();
+      if (!ai) return;
+
+      const maxDepth = getMaxDrillDownDepth();
+      const endpoint = resolveGeminiEndpoint();
+      const allResults: SubFunctionNode[] = [];
+      const visited = new Set<string>();
+      let idCounter = 0;
+
+      const analyzeFunctionCode = async ({
+        functionName,
+        callerFile,
+        functionCode,
+        functionFile,
+        depth,
+        parentId,
+      }: {
+        functionName: string;
+        callerFile: string;
+        functionCode: string;
+        functionFile: string;
+        depth: number;
+        parentId: string;
+      }) => {
+        if (currentFetchId !== fetchIdRef.current) return;
+        if (depth > maxDepth) return;
+
+        const fileList = allFiles.slice(0, 1500).join('\n');
+        const prompt = `Analyze the function below and identify up to 12 key child function calls.
+Project URL: ${targetUrl}
+Project Summary: ${projectSummary}
+Caller Function: ${functionName}
+Caller File: ${functionFile}
+Depth: ${depth}/${maxDepth}
+
+Available Files:
+${fileList}
+
+Function Code:
+\`\`\`
+${functionCode.substring(0, 12000)}
+\`\`\`
+
+For each child function return:
+1) name
+2) file (likely definition file path)
+3) description_en
+4) description_zh
+5) drillDown (-1=no, 0=unsure, 1=yes)`;
+
+        addLog(
+          { en: `AI drill-down analyzing ${functionName}...`, zh: `AI 正在下钻分析 ${functionName}...` },
+          'info',
+          {
+            request: {
+              model: 'gemini-3-flash-preview',
+              baseUrl: endpoint.baseUrl,
+              apiVersion: endpoint.apiVersion,
+              url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
+              depth,
+              maxDepth,
+              functionName,
+              functionFile,
+              prompt,
+            },
+          }
+        );
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                subFunctions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      name: { type: Type.STRING },
+                      file: { type: Type.STRING },
+                      description_en: { type: Type.STRING },
+                      description_zh: { type: Type.STRING },
+                      drillDown: { type: Type.INTEGER },
+                    },
+                    required: ['name', 'file', 'description_en', 'description_zh', 'drillDown'],
+                  },
+                },
+              },
+              required: ['subFunctions'],
+            },
+          },
+        });
+
+        if (!response.text) return;
+        const parsed = JSON.parse(response.text);
+        const children = parsed?.subFunctions || [];
+
+        for (const child of children) {
+          if (currentFetchId !== fetchIdRef.current) return;
+          const nodeId = `n-${idCounter++}`;
+          const normalizedCall = normalizeCalledFunctionName(child.name || 'unknown');
+          const node: SubFunctionNode = {
+            id: nodeId,
+            parentId,
+            depth,
+            name: normalizedCall.normalized || child.name || 'unknown',
+            file: child.file || '',
+            description_en: child.description_en || '',
+            description_zh: child.description_zh || '',
+            drillDown: Number.isInteger(child.drillDown) ? child.drillDown : 0,
+          };
+          allResults.push(node);
+          setSubFunctions([...allResults]);
+
+          if (!(node.drillDown === 0 || node.drillDown === 1)) continue;
+          if (depth >= maxDepth) continue;
+          if (isLikelySystemOrLibraryFunction(node.name)) continue;
+
+          const visitKey = `${node.file}::${normalizeCalledFunctionName(node.name).normalized || node.name}`.toLowerCase();
+          if (visited.has(visitKey)) continue;
+          visited.add(visitKey);
+
+          const located = await locateFunctionDefinition({
+            functionName: node.name,
+            parentFile: node.file || callerFile,
+            allFiles,
+            repo,
+            ai,
+            currentFetchId,
+          });
+
+          if (!located) {
+            addLog(
+              { en: `Stop drill-down: definition not found for ${node.name}`, zh: `停止下钻：未找到 ${node.name} 的定义` },
+              'warning',
+              { function: node.name, hintedFile: node.file, depth }
+            );
+            continue;
+          }
+
+          await analyzeFunctionCode({
+            functionName: node.name,
+            callerFile: located.file,
+            functionCode: located.code,
+            functionFile: located.file,
+            depth: depth + 1,
+            parentId: nodeId,
+          });
+        }
+      };
+
+      const entryContent = await fetchFileText(repo, entryFilePath);
+      if (!entryContent) {
+        addLog(
+          { en: 'Failed to fetch entry file content for recursive analysis.', zh: '递归分析时获取入口文件内容失败。' },
+          'error'
+        );
+        return;
+      }
+
+      await analyzeFunctionCode({
+        functionName: 'ENTRY',
+        callerFile: entryFilePath,
+        functionCode: entryContent.text,
+        functionFile: entryFilePath,
+        depth: 0,
+        parentId: 'root',
+      });
+
+      if (currentFetchId !== fetchIdRef.current) return;
+      setSubFunctions(allResults);
+      addLog(
+        { en: `Recursive sub-function analysis complete. Collected ${allResults.length} nodes.`, zh: `递归子函数分析完成。共收集 ${allResults.length} 个节点。` },
+        'success',
+        { maxDepth, totalNodes: allResults.length }
+      );
+    } catch (err: any) {
+      if (currentFetchId !== fetchIdRef.current) return;
+      addLog(
+        { en: `Error in recursive sub-function analysis: ${err.message}`, zh: `递归子函数分析出错: ${err.message}` },
+        'error'
+      );
+    } finally {
+      if (currentFetchId === fetchIdRef.current) {
+        setIsAnalyzingSubFunctions(false);
+      }
+    }
+  };
+
   const verifyEntryFiles = async (analysisResult: any, currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string, allFiles: string[]) => {
     addLog({ en: 'Starting entry file verification...', zh: '开始验证入口文件...' }, 'info');
     setIsVerifyingEntry(true);
-    
+
     try {
       const ai = createGeminiClient();
       if (!ai) return;
 
       for (const filePath of analysisResult.entryFiles) {
         if (currentFetchId !== fetchIdRef.current) return;
-        
+
         addLog({ en: `Fetching content for ${filePath}...`, zh: `正在获取 ${filePath} 的内容...` }, 'info');
         try {
-          const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${filePath}`;
-          const res = await fetch(rawUrl);
-          if (!res.ok) {
+          const fileContent = await fetchFileText(repo, filePath);
+          if (!fileContent) {
             addLog({ en: `Failed to fetch ${filePath}`, zh: `获取 ${filePath} 失败` }, 'warning');
             continue;
           }
-          
-          const text = await res.text();
+
+          const text = fileContent.text;
           const lines = text.split('\n');
           let contentToSend = text;
-          
+
           if (lines.length > 4000) {
             const first2000 = lines.slice(0, 2000).join('\n');
             const last2000 = lines.slice(-2000).join('\n');
@@ -264,7 +1035,7 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
           }
 
           const prompt = `Analyze the following file from a GitHub repository to determine if it is the main entry point of the project.
-          
+
 Project URL: ${targetUrl}
 Primary Language: ${analysisResult.primaryLanguage_en}
 Project Summary: ${analysisResult.summary_en}
@@ -278,16 +1049,16 @@ ${contentToSend}
 Determine if this file is the main entry point. Provide your reasoning.`;
 
           addLog({ en: `Verifying ${filePath} with AI...`, zh: `正在使用 AI 验证 ${filePath}...` }, 'info');
-          
-          addLog({ en: `AI Request Payload for ${filePath}`, zh: `${filePath} 的 AI 请求数据` }, 'info', { 
-            request: { 
-              model: "gemini-3-flash-preview", 
+
+          addLog({ en: `AI Request Payload for ${filePath}`, zh: `${filePath} 的 AI 请求数据` }, 'info', {
+            request: {
+              model: "gemini-3-flash-preview",
               baseUrl: resolveGeminiEndpoint().baseUrl,
               apiVersion: resolveGeminiEndpoint().apiVersion,
               url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
               promptLength: prompt.length,
               prompt: prompt
-            } 
+            }
           });
 
           const response = await ai.models.generateContent({
@@ -311,9 +1082,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
           if (response.text) {
             const result = JSON.parse(response.text);
-            addLog({ 
-              en: `Verification result for ${filePath}: ${result.isEntryFile ? 'Confirmed' : 'Rejected'}`, 
-              zh: `${filePath} 验证结果: ${result.isEntryFile ? '已确认' : '已拒绝'}` 
+            addLog({
+              en: `Verification result for ${filePath}: ${result.isEntryFile ? 'Confirmed' : 'Rejected'}`,
+              zh: `${filePath} 验证结果: ${result.isEntryFile ? '已确认' : '已拒绝'}`
             }, result.isEntryFile ? 'success' : 'info', { result });
 
             if (result.isEntryFile) {
@@ -323,15 +1094,23 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                 reason_zh: result.reason_zh
               });
               addLog({ en: `Found main entry file: ${filePath}`, zh: `找到主入口文件: ${filePath}` }, 'success');
-              
-              // Trigger sub-function analysis
-              analyzeSubFunctions(filePath, currentFetchId, repo, targetUrl, analysisResult.summary_en, allFiles);
-              
+
+              // Trigger recursive sub-function analysis
+              analyzeSubFunctionsRecursive(filePath, currentFetchId, repo, targetUrl, analysisResult.summary_en, allFiles);
+
               break; // Stop checking other files
             }
           }
         } catch (err: any) {
-          addLog({ en: `Error verifying ${filePath}: ${err.message}`, zh: `验证 ${filePath} 时出错: ${err.message}` }, 'error');
+          if (err instanceof GithubRequestError) {
+            addLog(
+              { en: `Error verifying ${filePath}: ${err.message}`, zh: `验证 ${filePath} 时出错: ${err.message}` },
+              'error',
+              { githubError: err.details }
+            );
+          } else {
+            addLog({ en: `Error verifying ${filePath}: ${err.message}`, zh: `验证 ${filePath} 时出错: ${err.message}` }, 'error');
+          }
         }
       }
     } finally {
@@ -340,7 +1119,6 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       }
     }
   };
-
   const analyzeWithAI = async (filePaths: string[], currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string) => {
     if (currentFetchId !== fetchIdRef.current) return;
     setIsAnalyzing(true);
@@ -441,11 +1219,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       // If branch is not specified, fetch the default branch
       if (!branch) {
         addLog({ en: `Fetching default branch for ${parsed.owner}/${parsed.repo}...`, zh: `正在获取 ${parsed.owner}/${parsed.repo} 的默认分支...` }, 'info');
-        const repoRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}`);
-        if (!repoRes.ok) {
-          throw new Error('Repository not found or API rate limit exceeded');
-        }
-        const repoData = await repoRes.json();
+        const repoData = await fetchGithubApiJson<{ default_branch: string }>(
+          `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`,
+          `Fetch repository metadata for ${parsed.owner}/${parsed.repo}`
+        );
         branch = repoData.default_branch;
       }
 
@@ -456,12 +1233,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
       // Fetch file tree
       addLog({ en: `Fetching file tree from GitHub...`, zh: `正在从 GitHub 获取文件树...` }, 'info');
-      const treeRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${branch}?recursive=1`);
-      if (!treeRes.ok) {
-        throw new Error('Failed to fetch repository tree');
-      }
-      
-      const treeData = await treeRes.json();
+      const treeData = await fetchGithubApiJson<{ truncated?: boolean; tree: any[] }>(
+        `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${branch}?recursive=1`,
+        `Fetch repository tree for ${parsed.owner}/${parsed.repo}@${branch}`
+      );
       if (currentFetchId !== fetchIdRef.current) return;
 
       if (treeData.truncated) {
@@ -475,6 +1250,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
       // Trigger AI Analysis
       const codeFiles = getCodeFiles(treeData.tree);
+      setCodeFilesList(codeFiles);
       addLog({ en: `Filtered code files: ${codeFiles.length} files found.`, zh: `过滤后的代码文件: 找到 ${codeFiles.length} 个文件。` }, 'info', { files: codeFiles });
       if (codeFiles.length > 0) {
         analyzeWithAI(codeFiles, currentFetchId, { owner: parsed.owner, repo: parsed.repo, branch: branch || 'main' }, targetUrl);
@@ -482,7 +1258,15 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
       setError(err.message || 'An error occurred while fetching data');
-      addLog({ en: `Error: ${err.message}`, zh: `错误: ${err.message}` }, 'error');
+      if (err instanceof GithubRequestError) {
+        addLog(
+          { en: `Error: ${err.message}`, zh: `错误: ${err.message}` },
+          'error',
+          { githubError: err.details }
+        );
+      } else {
+        addLog({ en: `Error: ${err.message}`, zh: `错误: ${err.message}` }, 'error');
+      }
     } finally {
       if (currentFetchId === fetchIdRef.current) {
         setLoading(false);
@@ -574,18 +1358,22 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
     try {
       if (!repoInfo) throw new Error('Repository info missing');
-      
-      // Fetch raw content
-      const rawUrl = `https://raw.githubusercontent.com/${repoInfo.owner}/${repoInfo.repo}/${repoInfo.branch}/${node.path}`;
-      const res = await fetch(rawUrl);
-      
-      if (!res.ok) {
+
+      const contentResult = await fetchFileText(repoInfo, node.path);
+      if (!contentResult) {
         throw new Error('Failed to fetch file content');
       }
-      
-      const content = await res.text();
+
+      const content = contentResult.text;
       setFileContent(content);
     } catch (err: any) {
+      if (err instanceof GithubRequestError) {
+        addLog(
+          { en: `Error loading file ${node.path}: ${err.message}`, zh: `加载文件 ${node.path} 失败: ${err.message}` },
+          'error',
+          { githubError: err.details }
+        );
+      }
       setFileContent(`${t[lang].errorLoading}: ${err.message}`);
     } finally {
       setContentLoading(false);
@@ -615,14 +1403,14 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             <button
               onClick={() => setShowFileTree(!showFileTree)}
               className={`p-1.5 rounded-md transition-colors ${showFileTree ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}
-              title={lang === 'en' ? 'Toggle File Tree' : '切换文件列表'}
+              title={lang === 'en' ? 'Toggle File Tree' : '切换文件树'}
             >
               <PanelLeft className="w-4 h-4" />
             </button>
             <button
               onClick={() => setShowCodeViewer(!showCodeViewer)}
               className={`p-1.5 rounded-md transition-colors ${showCodeViewer ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}
-              title={lang === 'en' ? 'Toggle Code Viewer' : '切换源码面板'}
+              title={lang === 'en' ? 'Toggle Code Viewer' : '切换代码面板'}
             >
               <Code2 className="w-4 h-4" />
             </button>
@@ -639,7 +1427,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             className="flex items-center px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-100 transition-colors shadow-sm"
           >
             <Languages className="w-4 h-4 mr-1.5 text-indigo-500" />
-            {lang === 'en' ? '中文' : 'English'}
+            {lang === 'en' ? '涓枃' : 'English'}
           </button>
         </div>
       </header>
@@ -1055,3 +1843,4 @@ export default function AnalyzePage() {
     </Suspense>
   );
 }
+
