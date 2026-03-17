@@ -4,10 +4,11 @@ import { useState, useEffect, Suspense, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2 } from 'lucide-react';
 import { FileTree } from '@/components/FileTree';
-import type { FileNode } from '@/lib/github';
+import type { FileNode, GithubNode } from '@/lib/github';
 import { CodeViewer } from '@/components/CodeViewer';
 import { Panorama } from '@/components/Panorama';
 import { parseGithubUrl, buildFileTree, getLanguageFromFilename, getCodeFiles } from '@/lib/github';
+import { buildEngineeringMarkdown, buildHistoryId, getAnalysisHistoryById, saveAnalysisHistoryRecord, type AiAnalysisSnapshot, type AnalysisHistoryRecord, type ConfirmedEntrySnapshot, type RepoInfoSnapshot, type StoredLogEntry, type StoredSubFunctionNode } from '@/lib/analysisHistory';
 import { GoogleGenAI, Type } from "@google/genai";
 import { Group, Panel, Separator } from 'react-resizable-panels';
 
@@ -63,6 +64,7 @@ function AnalyzeContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const initialUrl = searchParams.get('url') || '';
+  const historyId = searchParams.get('historyId') || '';
   const initialLang = (searchParams.get('lang') as 'en' | 'zh') || 'zh';
   
   const [url, setUrl] = useState(initialUrl);
@@ -90,14 +92,17 @@ function AnalyzeContent() {
   } | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isVerifyingEntry, setIsVerifyingEntry] = useState(false);
+  const [allFilePaths, setAllFilePaths] = useState<string[]>([]);
+  const [fileTreeNodes, setFileTreeNodes] = useState<GithubNode[]>([]);
   const [codeFilesList, setCodeFilesList] = useState<string[]>([]);
-  const [subFunctions, setSubFunctions] = useState<any[]>([]);
+  const [subFunctions, setSubFunctions] = useState<SubFunctionNode[]>([]);
   const [isAnalyzingSubFunctions, setIsAnalyzingSubFunctions] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showFileTree, setShowFileTree] = useState(true);
   const [showCodeViewer, setShowCodeViewer] = useState(true);
   const [showPanorama, setShowPanorama] = useState(true);
   const lastFetchedUrl = useRef('');
+  const lastSavedHistoryHash = useRef('');
   const fetchIdRef = useRef(0);
   const defaultGeminiApiVersion = "v1beta";
 
@@ -173,6 +178,27 @@ function AnalyzeContent() {
       return newObj;
     }
     return obj;
+  };
+
+  const serializeLogs = (items: LogEntry[]): StoredLogEntry[] => {
+    return items.map((item) => ({
+      id: item.id,
+      timestamp: item.timestamp.toISOString(),
+      type: item.type,
+      message: item.message,
+      details: item.details,
+    }));
+  };
+
+  const hydrateLogs = (items: StoredLogEntry[]): LogEntry[] => {
+    return items.map((item) => ({
+      id: item.id,
+      timestamp: new Date(item.timestamp),
+      type: item.type,
+      message: item.message,
+      details: item.details,
+      expanded: false,
+    }));
   };
 
   const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
@@ -778,7 +804,17 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
 
       if (response.text) {
         const result = JSON.parse(response.text);
-        setSubFunctions(result.subFunctions || []);
+        const nodes: SubFunctionNode[] = (result.subFunctions || []).map((item: any, index: number) => ({
+          id: `legacy-${index}`,
+          parentId: 'root',
+          depth: 0,
+          name: item?.name || 'unknown',
+          file: item?.file || '',
+          description_en: item?.description_en || '',
+          description_zh: item?.description_zh || '',
+          drillDown: Number.isInteger(item?.drillDown) ? item.drillDown : 0,
+        }));
+        setSubFunctions(nodes);
         addLog(
           { en: `Found ${result.subFunctions?.length || 0} sub-functions.`, zh: `找到 ${result.subFunctions?.length || 0} 个子函数。` },
           'success',
@@ -1202,6 +1238,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setLogs([]); // Clear logs on new fetch
     setAiAnalysis(null);
     setConfirmedEntryFile(null);
+    setAllFilePaths([]);
+    setFileTreeNodes([]);
+    setCodeFilesList([]);
+    setSubFunctions([]);
 
     addLog({ en: `Validating GitHub URL: ${targetUrl}`, zh: `校验 GitHub URL: ${targetUrl}` }, 'info');
     const parsed = parseGithubUrl(targetUrl);
@@ -1247,6 +1287,12 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
       const tree = buildFileTree(treeData.tree);
       setFileTree(tree);
+      setFileTreeNodes(treeData.tree as GithubNode[]);
+
+      const allFiles = treeData.tree
+        .filter((node: GithubNode) => node.type === 'blob')
+        .map((node: GithubNode) => node.path);
+      setAllFilePaths(allFiles);
 
       // Trigger AI Analysis
       const codeFiles = getCodeFiles(treeData.tree);
@@ -1275,12 +1321,96 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   };
 
   useEffect(() => {
+    if (!historyId) return;
+
+    const record = getAnalysisHistoryById(historyId);
+    if (!record) {
+      setError(lang === 'en' ? 'History record not found.' : '未找到历史分析记录。');
+      if (initialUrl && initialUrl !== lastFetchedUrl.current) {
+        lastFetchedUrl.current = initialUrl;
+        fetchRepoData(initialUrl);
+      }
+      return;
+    }
+
+    setUrl(record.projectUrl);
+    setLang(record.lang);
+    setError('');
+    setLoading(false);
+    setIsAnalyzing(false);
+    setIsVerifyingEntry(false);
+    setIsAnalyzingSubFunctions(false);
+    setSelectedFile(null);
+    setFileContent('');
+    setContentLoading(false);
+
+    setRepoInfo(record.repoInfo as RepoInfoSnapshot | null);
+    setAiAnalysis(record.aiAnalysis as AiAnalysisSnapshot | null);
+    setConfirmedEntryFile(record.confirmedEntryFile as ConfirmedEntrySnapshot | null);
+    setAllFilePaths(record.allFilePaths || []);
+    setCodeFilesList(record.codeFiles || []);
+    setFileTreeNodes(record.fileTreeNodes || []);
+    setFileTree(buildFileTree(record.fileTreeNodes || []));
+    setSubFunctions((record.subFunctions || []) as SubFunctionNode[]);
+    setLogs(hydrateLogs(record.agentLogs || []));
+
+    lastFetchedUrl.current = record.projectUrl;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyId]);
+
+  useEffect(() => {
+    if (historyId) return;
     if (initialUrl && initialUrl !== lastFetchedUrl.current) {
       lastFetchedUrl.current = initialUrl;
       fetchRepoData(initialUrl);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialUrl]);
+  }, [initialUrl, historyId]);
+
+  useEffect(() => {
+    if (!url.trim() || !repoInfo) return;
+
+    const projectName = `${repoInfo.owner}/${repoInfo.repo}`;
+    const recordId = buildHistoryId(repoInfo as RepoInfoSnapshot, url);
+    const serializedLogs = serializeLogs(logs);
+    const snapshotWithoutMarkdown = {
+      id: recordId,
+      projectUrl: url,
+      projectName,
+      lang,
+      repoInfo,
+      aiAnalysis,
+      confirmedEntryFile,
+      allFilePaths,
+      codeFiles: codeFilesList,
+      fileTreeNodes,
+      subFunctions,
+      agentLogs: serializedLogs,
+    };
+
+    const hash = JSON.stringify(snapshotWithoutMarkdown);
+    if (hash === lastSavedHistoryHash.current) return;
+    lastSavedHistoryHash.current = hash;
+
+    const savedAt = new Date().toISOString();
+    const baseRecord: Omit<AnalysisHistoryRecord, 'engineeringMarkdown'> = {
+      ...snapshotWithoutMarkdown,
+      savedAt,
+      fileTreeNodes: fileTreeNodes as GithubNode[],
+      subFunctions: subFunctions as StoredSubFunctionNode[],
+    };
+
+    const nextRecord: AnalysisHistoryRecord = {
+      ...baseRecord,
+      engineeringMarkdown: buildEngineeringMarkdown(baseRecord),
+    };
+
+    try {
+      saveAnalysisHistoryRecord(nextRecord);
+    } catch (err) {
+      console.warn('Failed to save analysis history:', err);
+    }
+  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, logs]);
 
   const t = {
     en: {
