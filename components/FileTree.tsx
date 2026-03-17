@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Folder, FolderOpen, File, FileCode, FileText, ChevronRight, ChevronDown } from 'lucide-react';
 
 export interface FileNode {
@@ -46,12 +46,27 @@ function FileTreeNode({
   level: number;
 }) {
   const [isOpen, setIsOpen] = useState(false);
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const isSelected = selectedPath === node.path;
   const isDir = node.type === 'tree';
+  const isAncestorOfSelected = Boolean(
+    isDir &&
+      selectedPath &&
+      selectedPath !== node.path &&
+      selectedPath.startsWith(`${node.path}/`)
+  );
+
+  const actuallyOpen = isOpen || isAncestorOfSelected;
+
+  useEffect(() => {
+    if (isSelected && rowRef.current) {
+      rowRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [isSelected]);
 
   const handleClick = () => {
     if (isDir) {
-      setIsOpen(!isOpen);
+      setIsOpen(!actuallyOpen);
     } else {
       onSelectFile(node);
     }
@@ -70,6 +85,7 @@ function FileTreeNode({
   return (
     <li>
       <div
+        ref={rowRef}
         className={`flex items-center py-1 px-2 cursor-pointer rounded-md hover:bg-slate-100 transition-colors ${
           isSelected ? 'bg-indigo-50 text-indigo-700' : 'text-slate-700'
         }`}
@@ -78,19 +94,19 @@ function FileTreeNode({
       >
         <div className="w-4 h-4 mr-1 flex items-center justify-center">
           {isDir && (
-            isOpen ? <ChevronDown className="w-3 h-3 text-slate-400" /> : <ChevronRight className="w-3 h-3 text-slate-400" />
+            actuallyOpen ? <ChevronDown className="w-3 h-3 text-slate-400" /> : <ChevronRight className="w-3 h-3 text-slate-400" />
           )}
         </div>
         <div className="mr-2">
           {isDir ? (
-            isOpen ? <FolderOpen className="w-4 h-4 text-indigo-400" /> : <Folder className="w-4 h-4 text-indigo-400" />
+            actuallyOpen ? <FolderOpen className="w-4 h-4 text-indigo-400" /> : <Folder className="w-4 h-4 text-indigo-400" />
           ) : (
             getFileIcon(node.name)
           )}
         </div>
         <span className="text-sm truncate select-none">{node.name}</span>
       </div>
-      {isDir && isOpen && node.children && (
+      {isDir && actuallyOpen && node.children && (
         <FileTree
           nodes={node.children}
           onSelectFile={onSelectFile}

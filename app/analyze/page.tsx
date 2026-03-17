@@ -42,6 +42,8 @@ type SubFunctionNode = {
   depth: number;
   name: string;
   file: string;
+  lineStart?: number;
+  lineEnd?: number;
   description_en: string;
   description_zh: string;
   drillDown: number;
@@ -72,6 +74,12 @@ type FunctionNameNormalization = {
   original: string;
   normalized: string;
   candidates: string[];
+};
+
+type AiUsageStats = {
+  inputTokens: number;
+  outputTokens: number;
+  totalCalls: number;
 };
 
 function AnalyzeContent() {
@@ -123,9 +131,13 @@ function AnalyzeContent() {
   const [showFileTree, setShowFileTree] = useState(true);
   const [showCodeViewer, setShowCodeViewer] = useState(true);
   const [showPanorama, setShowPanorama] = useState(true);
+  const [selectedLine, setSelectedLine] = useState<number | null>(null);
+  const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>({ inputTokens: 0, outputTokens: 0, totalCalls: 0 });
   const lastFetchedUrl = useRef('');
   const lastSavedHistoryHash = useRef('');
   const fetchIdRef = useRef(0);
+  const drillDownCacheRef = useRef<Map<string, any[]>>(new Map());
+  const functionLocationCacheRef = useRef<Map<string, LocatedFunction | null>>(new Map());
   const defaultGeminiApiVersion = "v1beta";
   const moduleColorPalette = ['#38bdf8', '#34d399', '#f59e0b', '#f97316', '#a78bfa', '#fb7185', '#2dd4bf', '#84cc16', '#eab308', '#60a5fa'];
 
@@ -168,13 +180,58 @@ function AnalyzeContent() {
 
   const addLog = (message: LocalizedString, type: LogEntry['type'] = 'info', details?: any) => {
     setLogs(prev => [...prev, {
-      id: Math.random().toString(36).substring(7),
+      id: Math.random().toString(36).slice(2, 10),
       timestamp: new Date(),
       type,
       message,
       details,
       expanded: false
     }]);
+  };
+
+  const addAiCallLog = (message: LocalizedString, request: any, type: LogEntry['type'] = 'info') => {
+    const id = Math.random().toString(36).slice(2, 10);
+    setLogs((prev) => [
+      ...prev,
+      {
+        id,
+        timestamp: new Date(),
+        type,
+        message,
+        details: {
+          aiCall: {
+            request,
+            status: 'pending',
+          },
+        },
+        expanded: false,
+      },
+    ]);
+    return id;
+  };
+
+  const finalizeAiCallLog = (id: string, payload: { response?: any; usage?: any; error?: any; success?: boolean }) => {
+    setLogs((prev) =>
+      prev.map((log) => {
+        if (log.id !== id) return log;
+        const existing = log.details?.aiCall || {};
+        const hasError = Boolean(payload.error);
+        return {
+          ...log,
+          type: hasError ? 'error' : payload.success === false ? 'warning' : 'success',
+          details: {
+            ...log.details,
+            aiCall: {
+              ...existing,
+              response: payload.response,
+              usage: payload.usage,
+              error: payload.error,
+              status: hasError ? 'failed' : payload.success === false ? 'incomplete' : 'completed',
+            },
+          },
+        };
+      })
+    );
   };
 
   const toggleLog = (id: string) => {
@@ -230,6 +287,25 @@ function AnalyzeContent() {
     label_zh: string
   ) => {
     setWorkflowStatus({ state, label_en, label_zh });
+  };
+
+  const extractAiUsage = (response: any) => {
+    const usage = response?.usageMetadata || response?.usage || {};
+    const inputTokens =
+      Number(usage.promptTokenCount ?? usage.inputTokenCount ?? usage.inputTokens ?? usage.prompt_tokens ?? 0) || 0;
+    const outputTokens =
+      Number(usage.candidatesTokenCount ?? usage.outputTokenCount ?? usage.outputTokens ?? usage.completion_tokens ?? 0) || 0;
+    return { inputTokens, outputTokens };
+  };
+
+  const recordAiUsage = (response: any) => {
+    const usage = extractAiUsage(response);
+    setAiUsageStats((prev) => ({
+      inputTokens: prev.inputTokens + usage.inputTokens,
+      outputTokens: prev.outputTokens + usage.outputTokens,
+      totalCalls: prev.totalCalls + 1,
+    }));
+    return usage;
   };
 
   const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
@@ -515,7 +591,8 @@ function AnalyzeContent() {
   };
 
   const isLikelySystemOrLibraryFunction = (name: string) => {
-    const n = name.trim().toLowerCase();
+    const leafName = name.trim().split('::').pop() || name.trim();
+    const n = leafName.toLowerCase();
     if (!n) return true;
     const deny = new Set([
       'render',
@@ -532,7 +609,7 @@ function AnalyzeContent() {
       'map',
       'filter',
       'reduce',
-      'forEach',
+      'foreach',
       'then',
       'catch',
       'finally',
@@ -541,8 +618,30 @@ function AnalyzeContent() {
       'usestate',
     ]);
     if (deny.has(n)) return true;
-    if (/^(get|set|is)[A-Z_]/.test(name)) return false;
+    if (/^(get|set|is)[A-Z_]/.test(leafName)) return false;
     return n.length <= 2;
+  };
+
+  const stripFunctionCallDecorators = (input: string) => {
+    return input
+      .replace(/\s+/g, ' ')
+      .replace(/^[*&\s]+/, '')
+      .replace(/^(?:await|new)\s+/i, '')
+      .replace(/\(.*$/, '')
+      .replace(/[;,\s]+$/, '')
+      .trim();
+  };
+
+  const getFunctionLeafName = (input: string) => {
+    const withoutScope = input.split('::').pop() || input;
+    const withoutDot = withoutScope.split('.').pop() || withoutScope;
+    const withoutArrow = withoutDot.split('->').pop() || withoutDot;
+    return withoutArrow.replace(/<[^<>]*>/g, '').trim();
+  };
+
+  const buildFunctionCacheKey = (file: string, functionName: string) => {
+    const normalized = normalizeCalledFunctionName(functionName).normalized || functionName.trim();
+    return `${(file || '').toLowerCase()}::${normalized.toLowerCase()}`;
   };
 
   const normalizeCalledFunctionName = (input: string): FunctionNameNormalization => {
@@ -555,13 +654,7 @@ function AnalyzeContent() {
       };
     }
 
-    let value = original
-      .replace(/\s+/g, ' ')
-      .replace(/^[*&\s]+/, '')
-      .replace(/^(?:await|new)\s+/i, '')
-      .replace(/\(.*$/, '')
-      .replace(/[;,\s]+$/, '')
-      .trim();
+    let value = stripFunctionCallDecorators(original);
 
     if (!value) {
       return {
@@ -571,44 +664,46 @@ function AnalyzeContent() {
       };
     }
 
-    const byArrow = value.split('->').pop() || value;
-    const byDot = byArrow.split('.').pop() || byArrow;
-    const byScope = byDot.split('::').pop() || byDot;
-    const cleaned = byScope
+    const cleaned = value
       .replace(/<[^<>]*>/g, '')
       .replace(/\[.*\]$/, '')
       .replace(/^['"`]|['"`]$/g, '')
       .trim();
+    const leaf = getFunctionLeafName(cleaned);
 
     const candidates = Array.from(
       new Set(
-        [cleaned, byScope.trim(), byDot.trim(), byArrow.trim(), value.trim(), original]
+        [cleaned, leaf, value.trim(), original]
           .filter(Boolean)
       )
     );
 
     return {
       original,
-      normalized: cleaned || byScope || value,
+      normalized: cleaned || value,
       candidates,
     };
   };
 
   const buildFunctionDefinitionRegexes = (fnName: string) => {
-    const escaped = fnName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const normalized = stripFunctionCallDecorators(fnName);
+    const leafName = getFunctionLeafName(normalized);
+    const escapedLeaf = leafName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedRaw = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hasScope = normalized.includes('::');
     return [
-      new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`, 'm'),
-      new RegExp(`\\b(?:const|let|var)\\s+${escaped}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
-      new RegExp(`\\b${escaped}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
-      new RegExp(`\\b(?:public|private|protected|static|async|export\\s+)*${escaped}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
-      new RegExp(`\\bdef\\s+${escaped}\\s*\\(`, 'm'),
-      new RegExp(`\\b(?:func|fn)\\s+${escaped}\\s*\\(`, 'm'),
-      new RegExp(`\\b${escaped}\\s*:\\s*function\\s*\\(`, 'm'),
-      new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
+      new RegExp(`\\bfunction\\s+${escapedLeaf}\\s*\\(`, 'm'),
+      new RegExp(`\\b(?:const|let|var)\\s+${escapedLeaf}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
+      new RegExp(`\\b${escapedLeaf}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>`, 'm'),
+      new RegExp(`\\b(?:public|private|protected|static|async|export\\s+)*${escapedLeaf}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
+      new RegExp(`\\bdef\\s+${escapedLeaf}\\s*\\(`, 'm'),
+      new RegExp(`\\b(?:func|fn)\\s+${escapedLeaf}\\s*\\(`, 'm'),
+      new RegExp(`\\b${escapedLeaf}\\s*:\\s*function\\s*\\(`, 'm'),
+      new RegExp(`\\b${escapedLeaf}\\s*\\([^)]*\\)\\s*\\{`, 'm'),
       // C/C++ free function definition with return type/qualifiers.
-      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b${escaped}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
+      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b${hasScope ? escapedRaw : escapedLeaf}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
       // C++ class/namespace scoped definition: ClassName::method(...)
-      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b[\\w:<>~]+::${escaped}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
+      new RegExp(`(?:^|[;{}]\\s*)(?:inline\\s+|constexpr\\s+|static\\s+|virtual\\s+|extern\\s+|friend\\s+|typename\\s+|template\\s*<[^>]+>\\s*)*[\\w:\\<\\>\\*&~\\s]+\\b${hasScope ? escapedRaw : `[\\w:<>~]+::${escapedLeaf}`}\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:noexcept\\s*)?(?:->\\s*[\\w:\\<\\>\\*&\\s]+\\s*)?\\{`, 'm'),
     ];
   };
 
@@ -726,6 +821,7 @@ ${fileList}`;
           },
         },
       });
+      recordAiUsage(guessResp);
 
       if (guessResp.text) {
         const guessed = JSON.parse(guessResp.text)?.candidateFiles || [];
@@ -758,6 +854,7 @@ ${fileList}`;
     setIsAnalyzingSubFunctions(true);
     setSubFunctions([]);
     addLog({ en: 'Starting sub-function analysis...', zh: '开始分析子函数...' }, 'info');
+    let aiCallLogId: string | null = null;
 
     try {
       const ai = createGeminiClient();
@@ -772,7 +869,7 @@ ${fileList}`;
       
       const fileList = allFiles.slice(0, 1000).join('\n');
       
-      const prompt = `Analyze the following entry file from a GitHub repository to identify the key sub-functions it calls.
+      const prompt = `Analyze the following entry file from a GitHub repository to identify key sub-functions related to the CORE feature flow.
       
 Project URL: ${targetUrl}
 Project Summary: ${projectSummary}
@@ -786,6 +883,11 @@ Entry File Content:
 ${text.substring(0, 10000)} // truncate to avoid token limits
 \`\`\`
 
+Rules:
+1) Return ONLY child calls important to core business flow, orchestration, external interactions, or key error handling.
+2) EXCLUDE routine utilities and low-value operations: common data structure operations, simple string helpers, trivial getters/setters, and generic framework lifecycle hooks.
+3) For object-oriented languages, if a function belongs to class/namespace, the name must include class scope (example: ClassName::FunctionName).
+
 Identify up to 20 key sub-functions called within this entry file. For each sub-function, provide:
 1. name: The name of the sub-function.
 2. file: The likely file path where this sub-function is defined (guess based on the available files and context).
@@ -793,15 +895,17 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
 4. description_zh: A brief description of what this sub-function likely does (in Chinese).
 5. drillDown: Whether it's worth further drill-down analysis (-1 for no, 0 for unsure, 1 for yes).`;
 
-      addLog({ en: 'Analyzing sub-functions with AI...', zh: '正在使用 AI 分析子函数...' }, 'info', {
-        request: {
-          model: "gemini-3-flash-preview",
-          baseUrl: resolveGeminiEndpoint().baseUrl,
-          apiVersion: resolveGeminiEndpoint().apiVersion,
-          url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
-          prompt: prompt
-        }
-      });
+      const aiRequest = {
+        model: "gemini-3-flash-preview",
+        baseUrl: resolveGeminiEndpoint().baseUrl,
+        apiVersion: resolveGeminiEndpoint().apiVersion,
+        url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
+        prompt,
+      };
+      aiCallLogId = addAiCallLog(
+        { en: 'Analyzing sub-functions with AI...', zh: '正在使用 AI 分析子函数...' },
+        aiRequest
+      );
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
@@ -830,11 +934,13 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
           }
         }
       });
+      const usage = recordAiUsage(response);
 
       if (currentFetchId !== fetchIdRef.current) return;
 
       if (response.text) {
         const result = JSON.parse(response.text);
+        finalizeAiCallLog(aiCallLogId, { response: result, usage, success: true });
         const nodes: SubFunctionNode[] = (result.subFunctions || []).map((item: any, index: number) => ({
           id: `legacy-${index}`,
           parentId: 'root',
@@ -849,11 +955,16 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
         addLog(
           { en: `Found ${result.subFunctions?.length || 0} sub-functions.`, zh: `找到 ${result.subFunctions?.length || 0} 个子函数。` },
           'success',
-          { result }
+          { result, usage }
         );
+      } else {
+        finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
       }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
+      if (typeof aiCallLogId === 'string') {
+        finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+      }
       addLog({ en: `Error analyzing sub-functions: ${err.message}`, zh: `分析子函数时出错: ${err.message}` }, 'error');
     } finally {
       if (currentFetchId === fetchIdRef.current) {
@@ -890,8 +1001,10 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
       const maxDepth = getMaxDrillDownDepth();
       const endpoint = resolveGeminiEndpoint();
       const allResults: SubFunctionNode[] = [];
-      const visited = new Set<string>();
       let idCounter = 0;
+      const activeStack = new Set<string>();
+      const drillDownCache = drillDownCacheRef.current;
+      const locationCache = functionLocationCacheRef.current;
 
       const analyzeFunctionCode = async ({
         functionName,
@@ -911,8 +1024,36 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
         if (currentFetchId !== fetchIdRef.current) return;
         if (depth > maxDepth) return;
 
-        const fileList = allFiles.slice(0, 1500).join('\n');
-        const prompt = `Analyze the function below and identify up to 12 key child function calls.
+        const functionKey = buildFunctionCacheKey(functionFile, functionName);
+        if (activeStack.has(functionKey)) {
+          addLog(
+            { en: `Skip cycle call: ${functionName}`, zh: `跳过循环调用: ${functionName}` },
+            'warning',
+            { functionName, functionFile, depth }
+          );
+          return;
+        }
+        activeStack.add(functionKey);
+
+        try {
+          let children: any[] = [];
+          const cachedChildren = drillDownCache.get(functionKey);
+          if (cachedChildren) {
+            addLog(
+              { en: `Drill-down cache hit: ${functionName}`, zh: `下钻缓存命中: ${functionName}` },
+              'info',
+              { cacheKey: functionKey, cachedChildren: cachedChildren.length, depth }
+            );
+            children = cachedChildren.map((item) => ({ ...item }));
+          } else {
+            addLog(
+              { en: `Drill-down cache miss: ${functionName}`, zh: `下钻缓存未命中: ${functionName}` },
+              'info',
+              { cacheKey: functionKey, depth }
+            );
+
+            const fileList = allFiles.slice(0, 1500).join('\n');
+            const prompt = `Analyze the function below and identify up to 12 key child function calls that are part of the CORE business/control flow.
 Project URL: ${targetUrl}
 Project Summary: ${analysisContext.summary_en}
 Caller Function: ${functionName}
@@ -927,6 +1068,12 @@ Function Code:
 ${functionCode.substring(0, 12000)}
 \`\`\`
 
+Strict rules:
+1) Return ONLY child calls that are essential to core feature flow, business logic transitions, orchestration, external system interactions, or critical error handling.
+2) EXCLUDE generic utilities and low-value operations: plain data structure ops (map/filter/reduce/forEach/push/pop/sort), string formatting/parsing helpers, trivial getters/setters, logging wrappers, and basic framework lifecycle hooks.
+3) For object-oriented languages, if a call belongs to a class/namespace, name MUST use full qualified form (example: ClassName::FunctionName). Do not return only FunctionName in this case.
+4) Keep max 12 results and prioritize impact on end-to-end behavior.
+
 For each child function return:
 1) name
 2) file (likely definition file path)
@@ -934,107 +1081,143 @@ For each child function return:
 4) description_zh
 5) drillDown (-1=no, 0=unsure, 1=yes)`;
 
-        addLog(
-          { en: `AI drill-down analyzing ${functionName}...`, zh: `AI 正在下钻分析 ${functionName}...` },
-          'info',
-          {
-            request: {
-              model: 'gemini-3-flash-preview',
-              baseUrl: endpoint.baseUrl,
-              apiVersion: endpoint.apiVersion,
-              url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
-              depth,
-              maxDepth,
-              functionName,
-              functionFile,
-              prompt,
-            },
-          }
-        );
+            const aiCallLogId = addAiCallLog(
+              { en: `AI drill-down analyzing ${functionName}...`, zh: `AI 正在下钻分析 ${functionName}...` },
+              {
+                model: 'gemini-3-flash-preview',
+                baseUrl: endpoint.baseUrl,
+                apiVersion: endpoint.apiVersion,
+                url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
+                depth,
+                maxDepth,
+                functionName,
+                functionFile,
+                prompt,
+              }
+            );
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                subFunctions: {
-                  type: Type.ARRAY,
-                  items: {
+            try {
+              const response = await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: {
                     type: Type.OBJECT,
                     properties: {
-                      name: { type: Type.STRING },
-                      file: { type: Type.STRING },
-                      description_en: { type: Type.STRING },
-                      description_zh: { type: Type.STRING },
-                      drillDown: { type: Type.INTEGER },
+                      subFunctions: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            name: { type: Type.STRING },
+                            file: { type: Type.STRING },
+                            description_en: { type: Type.STRING },
+                            description_zh: { type: Type.STRING },
+                            drillDown: { type: Type.INTEGER },
+                          },
+                          required: ['name', 'file', 'description_en', 'description_zh', 'drillDown'],
+                        },
+                      },
                     },
-                    required: ['name', 'file', 'description_en', 'description_zh', 'drillDown'],
+                    required: ['subFunctions'],
                   },
                 },
-              },
-              required: ['subFunctions'],
-            },
-          },
-        });
+              });
+              const usage = recordAiUsage(response);
 
-        if (!response.text) return;
-        const parsed = JSON.parse(response.text);
-        const children = parsed?.subFunctions || [];
-
-        for (const child of children) {
-          if (currentFetchId !== fetchIdRef.current) return;
-          const nodeId = `n-${idCounter++}`;
-          const normalizedCall = normalizeCalledFunctionName(child.name || 'unknown');
-          const node: SubFunctionNode = {
-            id: nodeId,
-            parentId,
-            depth,
-            name: normalizedCall.normalized || child.name || 'unknown',
-            file: child.file || '',
-            description_en: child.description_en || '',
-            description_zh: child.description_zh || '',
-            drillDown: Number.isInteger(child.drillDown) ? child.drillDown : 0,
-          };
-          allResults.push(node);
-          setSubFunctions([...allResults]);
-
-          if (!(node.drillDown === 0 || node.drillDown === 1)) continue;
-          if (depth >= maxDepth) continue;
-          if (isLikelySystemOrLibraryFunction(node.name)) continue;
-
-          const visitKey = `${node.file}::${normalizeCalledFunctionName(node.name).normalized || node.name}`.toLowerCase();
-          if (visited.has(visitKey)) continue;
-          visited.add(visitKey);
-
-          const located = await locateFunctionDefinition({
-            functionName: node.name,
-            parentFile: node.file || callerFile,
-            allFiles,
-            repo,
-            ai,
-            currentFetchId,
-          });
-
-          if (!located) {
-            addLog(
-              { en: `Stop drill-down: definition not found for ${node.name}`, zh: `停止下钻：未找到 ${node.name} 的定义` },
-              'warning',
-              { function: node.name, hintedFile: node.file, depth }
-            );
-            continue;
+              if (!response.text) {
+                finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
+                return;
+              }
+              const parsed = JSON.parse(response.text);
+              children = Array.isArray(parsed?.subFunctions) ? parsed.subFunctions : [];
+              drillDownCache.set(functionKey, children.map((item: any) => ({ ...item })));
+              finalizeAiCallLog(aiCallLogId, {
+                response: { ...parsed, cacheStored: true, cacheKey: functionKey },
+                usage,
+                success: true,
+              });
+            } catch (err: any) {
+              finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+              throw err;
+            }
           }
 
-          await analyzeFunctionCode({
-            functionName: node.name,
-            callerFile: located.file,
-            functionCode: located.code,
-            functionFile: located.file,
-            depth: depth + 1,
-            parentId: nodeId,
-          });
+          for (const child of children) {
+            if (currentFetchId !== fetchIdRef.current) return;
+            const nodeId = `n-${idCounter++}`;
+            const normalizedCall = normalizeCalledFunctionName(child?.name || 'unknown');
+            const node: SubFunctionNode = {
+              id: nodeId,
+              parentId,
+              depth,
+              name: (child?.name || normalizedCall.normalized || 'unknown').trim(),
+              file: child?.file || '',
+              lineStart: Number.isInteger(child?.lineStart) ? child.lineStart : undefined,
+              lineEnd: Number.isInteger(child?.lineEnd) ? child.lineEnd : undefined,
+              description_en: child?.description_en || '',
+              description_zh: child?.description_zh || '',
+              drillDown: Number.isInteger(child?.drillDown) ? child.drillDown : 0,
+            };
+            allResults.push(node);
+            setSubFunctions([...allResults]);
+
+            if (!(node.drillDown === 0 || node.drillDown === 1)) continue;
+            if (depth >= maxDepth) continue;
+            if (isLikelySystemOrLibraryFunction(node.name)) continue;
+
+            const locationKey = buildFunctionCacheKey(node.file || callerFile, node.name);
+            let located: LocatedFunction | null = null;
+            if (locationCache.has(locationKey)) {
+              located = locationCache.get(locationKey) || null;
+              addLog(
+                { en: `Location cache hit: ${node.name}`, zh: `定位缓存命中: ${node.name}` },
+                'info',
+                { cacheKey: locationKey, found: Boolean(located) }
+              );
+            } else {
+              addLog(
+                { en: `Location cache miss: ${node.name}`, zh: `定位缓存未命中: ${node.name}` },
+                'info',
+                { cacheKey: locationKey }
+              );
+              located = await locateFunctionDefinition({
+                functionName: node.name,
+                parentFile: node.file || callerFile,
+                allFiles,
+                repo,
+                ai,
+                currentFetchId,
+              });
+              locationCache.set(locationKey, located);
+            }
+
+            if (!located) {
+              addLog(
+                { en: `Stop drill-down: definition not found for ${node.name}`, zh: `停止下钻：未找到 ${node.name} 的定义` },
+                'warning',
+                { function: node.name, hintedFile: node.file, depth }
+              );
+              continue;
+            }
+
+            node.file = located.file || node.file;
+            node.lineStart = located.lineStart;
+            node.lineEnd = located.lineEnd;
+            setSubFunctions([...allResults]);
+
+            await analyzeFunctionCode({
+              functionName: node.name,
+              callerFile: located.file,
+              functionCode: located.code,
+              functionFile: located.file,
+              depth: depth + 1,
+              parentId: nodeId,
+            });
+          }
+        } finally {
+          activeStack.delete(functionKey);
         }
       };
 
@@ -1090,6 +1273,7 @@ For each child function return:
   ) => {
     if (currentFetchId !== fetchIdRef.current) return;
     if (!nodes.length) return;
+    let aiCallLogId: string | null = null;
 
     setIsAnalyzingModules(true);
     setWorkflow('working', 'AI is grouping function modules...', 'AI 正在划分功能模块...');
@@ -1126,18 +1310,15 @@ Rules:
 Function Nodes JSON:
 ${JSON.stringify(compactNodes)}`;
 
-      addLog(
-        { en: 'AI Request Payload for module grouping', zh: '模块划分的 AI 请求数据' },
-        'info',
+      aiCallLogId = addAiCallLog(
+        { en: 'Function module grouping AI call', zh: '函数模块划分 AI 调用' },
         {
-          request: {
-            model: 'gemini-3.1-pro-preview',
-            baseUrl: endpoint.baseUrl,
-            apiVersion: endpoint.apiVersion,
-            url: `${endpoint.requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
-            nodeCount: compactNodes.length,
-            prompt,
-          },
+          model: 'gemini-3.1-pro-preview',
+          baseUrl: endpoint.baseUrl,
+          apiVersion: endpoint.apiVersion,
+          url: `${endpoint.requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
+          nodeCount: compactNodes.length,
+          prompt,
         }
       );
 
@@ -1169,14 +1350,17 @@ ${JSON.stringify(compactNodes)}`;
           },
         },
       });
+      const usage = recordAiUsage(response);
 
       if (currentFetchId !== fetchIdRef.current) return;
       if (!response.text) {
+        finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
         setWorkflow('completed', 'Workflow completed', '工作流已完成');
         return;
       }
 
       const parsed = JSON.parse(response.text);
+      finalizeAiCallLog(aiCallLogId, { response: parsed, usage, success: true });
       const rawModules = Array.isArray(parsed?.modules) ? parsed.modules.slice(0, 10) : [];
 
       const modules: FunctionModule[] = rawModules.map((item: any, index: number) => ({
@@ -1215,11 +1399,14 @@ ${JSON.stringify(compactNodes)}`;
       addLog(
         { en: `Function modules grouped: ${modules.length}`, zh: `函数模块划分完成，共 ${modules.length} 个模块` },
         'success',
-        { response: { modules } }
+        { response: { modules }, usage }
       );
       setWorkflow('completed', 'Workflow completed', '工作流已完成');
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
+      if (aiCallLogId) {
+        finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+      }
       setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
       addLog({ en: `Function module grouping failed: ${err.message}`, zh: `函数模块划分失败: ${err.message}` }, 'error');
     } finally {
@@ -1267,6 +1454,7 @@ ${JSON.stringify(compactNodes)}`;
         if (currentFetchId !== fetchIdRef.current) return;
 
         addLog({ en: `Fetching content for ${filePath}...`, zh: `正在获取 ${filePath} 的内容...` }, 'info');
+        let aiCallLogId: string | null = null;
         try {
           const fileContent = await fetchFileText(repo, filePath);
           if (!fileContent) {
@@ -1300,17 +1488,17 @@ ${contentToSend}
 Determine if this file is the main entry point. Provide your reasoning.`;
 
           addLog({ en: `Verifying ${filePath} with AI...`, zh: `正在使用 AI 验证 ${filePath}...` }, 'info');
-
-          addLog({ en: `AI Request Payload for ${filePath}`, zh: `${filePath} 的 AI 请求数据` }, 'info', {
-            request: {
+          aiCallLogId = addAiCallLog(
+            { en: `Entry verification AI call: ${filePath}`, zh: `入口验证 AI 调用: ${filePath}` },
+            {
               model: "gemini-3-flash-preview",
               baseUrl: resolveGeminiEndpoint().baseUrl,
               apiVersion: resolveGeminiEndpoint().apiVersion,
               url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
               promptLength: prompt.length,
-              prompt: prompt
+              prompt,
             }
-          });
+          );
 
           const response = await ai.models.generateContent({
             model: "gemini-3-flash-preview",
@@ -1328,15 +1516,17 @@ Determine if this file is the main entry point. Provide your reasoning.`;
               }
             }
           });
+          const usage = recordAiUsage(response);
 
           if (currentFetchId !== fetchIdRef.current) return;
 
           if (response.text) {
             const result = JSON.parse(response.text);
+            finalizeAiCallLog(aiCallLogId, { response: result, usage, success: true });
             addLog({
               en: `Verification result for ${filePath}: ${result.isEntryFile ? 'Confirmed' : 'Rejected'}`,
               zh: `${filePath} 验证结果: ${result.isEntryFile ? '已确认' : '已拒绝'}`
-            }, result.isEntryFile ? 'success' : 'info', { result });
+            }, result.isEntryFile ? 'success' : 'info', { result, usage });
 
             if (result.isEntryFile) {
               foundEntry = true;
@@ -1363,8 +1553,13 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
               break; // Stop checking other files
             }
+          } else {
+            finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
           }
         } catch (err: any) {
+          if (aiCallLogId) {
+            finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+          }
           if (err instanceof GithubRequestError) {
             addLog(
               { en: `Error verifying ${filePath}: ${err.message}`, zh: `验证 ${filePath} 时出错: ${err.message}` },
@@ -1393,6 +1588,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setConfirmedEntryFile(null);
     setWorkflow('working', 'AI is analyzing repository...', 'AI 正在分析仓库...');
     addLog({ en: 'Starting AI analysis...', zh: '开始 AI 分析...' }, 'info');
+    let aiCallLogId: string | null = null;
     try {
       const ai = createGeminiClient();
       if (!ai) {
@@ -1407,17 +1603,18 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       const prompt = `Analyze the following list of file paths from a GitHub repository. Determine the primary programming language, the technology stack (frameworks, libraries, tools), the likely main entry files, and provide a brief project summary based on the file structure.\n\nFiles:\n${pathsToAnalyze}`;
 
       if (currentFetchId !== fetchIdRef.current) return;
-      addLog({ en: 'AI Request Payload', zh: 'AI 请求数据' }, 'info', { 
-        request: { 
-          model: "gemini-3.1-pro-preview", 
+      aiCallLogId = addAiCallLog(
+        { en: 'Repository analysis AI call', zh: '仓库分析 AI 调用' },
+        {
+          model: "gemini-3.1-pro-preview",
           baseUrl: resolveGeminiEndpoint().baseUrl,
           apiVersion: resolveGeminiEndpoint().apiVersion,
           url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
           promptLength: prompt.length,
           filesCount: filePaths.slice(0, 2000).length,
-          prompt: prompt
-        } 
-      });
+          prompt,
+        }
+      );
 
       const response = await ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
@@ -1438,18 +1635,24 @@ Determine if this file is the main entry point. Provide your reasoning.`;
           }
         }
       });
+      const usage = recordAiUsage(response);
 
       if (currentFetchId !== fetchIdRef.current) return;
 
       if (response.text) {
         const result = JSON.parse(response.text);
+        finalizeAiCallLog(aiCallLogId, { response: result, usage, success: true });
         setAiAnalysis(result);
-        addLog({ en: 'AI Response Payload', zh: 'AI 响应数据' }, 'success', { response: result });
         
         await verifyEntryFiles(result, currentFetchId, repo, targetUrl, filePaths);
+      } else {
+        finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
       }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
+      if (aiCallLogId) {
+        finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+      }
       console.error("AI Analysis failed:", err);
       setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
       addLog({ en: `AI analysis failed: ${err.message}`, zh: `AI 分析失败: ${err.message}` }, 'error', { error: err });
@@ -1480,6 +1683,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setFunctionModules([]);
     setActiveModuleId(null);
     setIsAnalyzingModules(false);
+    setSelectedLine(null);
+    setAiUsageStats({ inputTokens: 0, outputTokens: 0, totalCalls: 0 });
+    drillDownCacheRef.current.clear();
+    functionLocationCacheRef.current.clear();
 
     addLog({ en: `Validating GitHub URL: ${targetUrl}`, zh: `校验 GitHub URL: ${targetUrl}` }, 'info');
     const parsed = parseGithubUrl(targetUrl);
@@ -1585,6 +1792,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setIsAnalyzingSubFunctions(false);
     setIsAnalyzingModules(false);
     setSelectedFile(null);
+    setSelectedLine(null);
     setFileContent('');
     setContentLoading(false);
 
@@ -1599,6 +1807,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setFunctionModules((record.functionModules || []) as FunctionModule[]);
     setActiveModuleId(null);
     setLogs(hydrateLogs(record.agentLogs || []));
+    setAiUsageStats((record as any).aiUsageStats || { inputTokens: 0, outputTokens: 0, totalCalls: 0 });
     setWorkflow('completed', 'Loaded from history', '已加载历史记录');
 
     lastFetchedUrl.current = record.projectUrl;
@@ -1634,6 +1843,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       subFunctions,
       functionModules,
       agentLogs: serializedLogs,
+      aiUsageStats,
     };
 
     const hash = JSON.stringify(snapshotWithoutMarkdown);
@@ -1659,7 +1869,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } catch (err) {
       console.warn('Failed to save analysis history:', err);
     }
-  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs]);
+  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs, aiUsageStats]);
 
   const t = {
     en: {
@@ -1736,12 +1946,13 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     }
   };
 
-  const handleSelectFile = async (node: FileNode) => {
+  const handleSelectFile = async (node: FileNode, targetLine?: number | null) => {
     if (node.type === 'tree') return;
     
     setSelectedFile(node);
     setContentLoading(true);
     setFileContent('');
+    setSelectedLine(targetLine ?? null);
 
     try {
       if (!repoInfo) throw new Error('Repository info missing');
@@ -1765,6 +1976,56 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } finally {
       setContentLoading(false);
     }
+  };
+
+  const handleOpenPanoramaNodeSource = async (node: { name: string; file: string; lineStart?: number; lineEnd?: number }) => {
+    if (!repoInfo) return;
+    setShowFileTree(true);
+    setShowCodeViewer(true);
+
+    let resolvedFile = node.file || '';
+    let resolvedLine = node.lineStart || null;
+
+    if (!resolvedLine) {
+      const locationKey = buildFunctionCacheKey(resolvedFile || confirmedEntryFile?.path || '', node.name);
+      let located = functionLocationCacheRef.current.get(locationKey) || null;
+      if (!located) {
+        const ai = createGeminiClient();
+        if (ai) {
+          located = await locateFunctionDefinition({
+            functionName: node.name,
+            parentFile: resolvedFile || confirmedEntryFile?.path || '',
+            allFiles: allFilePaths,
+            repo: repoInfo,
+            ai,
+            currentFetchId: fetchIdRef.current,
+          });
+          functionLocationCacheRef.current.set(locationKey, located);
+        }
+      }
+      if (located) {
+        resolvedFile = located.file || resolvedFile;
+        resolvedLine = located.lineStart || resolvedLine;
+      }
+    }
+
+    if (!resolvedFile) {
+      addLog(
+        { en: `Cannot open source for ${node.name}: file unknown`, zh: `无法打开 ${node.name} 的源码：文件未知` },
+        'warning'
+      );
+      return;
+    }
+
+    const githubNode = fileTreeNodes.find((item) => item.path === resolvedFile);
+    const fileNode: FileNode = {
+      path: resolvedFile,
+      name: resolvedFile.split('/').pop() || resolvedFile,
+      type: 'blob',
+      url: githubNode?.url || '',
+    };
+
+    await handleSelectFile(fileNode, resolvedLine);
   };
 
   return (
@@ -1879,6 +2140,17 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                     </button>
                   </div>
                   <div className="bg-slate-900 rounded-lg border border-slate-800 overflow-hidden flex flex-col max-h-64">
+                    <div className="px-2.5 py-2 border-b border-slate-800 text-[10px] text-slate-300 grid grid-cols-3 gap-2">
+                      <div>
+                        {lang === 'en' ? 'AI Calls' : 'AI 调用次数'}: <span className="text-emerald-300">{aiUsageStats.totalCalls}</span>
+                      </div>
+                      <div>
+                        {lang === 'en' ? 'Input Tokens' : '输入 Tokens'}: <span className="text-indigo-300">{aiUsageStats.inputTokens}</span>
+                      </div>
+                      <div>
+                        {lang === 'en' ? 'Output Tokens' : '输出 Tokens'}: <span className="text-amber-300">{aiUsageStats.outputTokens}</span>
+                      </div>
+                    </div>
                     <div className="overflow-y-auto p-2 space-y-1 font-mono text-[10px] sm:text-xs">
                       {logs.map(log => (
                         <div key={log.id} className="flex flex-col">
@@ -1910,7 +2182,39 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                           </div>
                           {log.expanded && log.details && (
                             <div className="ml-6 mr-2 mb-2 mt-1 p-2 bg-slate-950 rounded border border-slate-800 overflow-x-auto">
-                              {log.details.request?.prompt ? (
+                              {log.details.aiCall ? (
+                                <div className="space-y-2">
+                                  <details className="group" open>
+                                    <summary className="cursor-pointer text-indigo-300 text-xs font-semibold">
+                                      {lang === 'en' ? 'AI Request (Prompt)' : 'AI 请求 (Prompt)'}
+                                    </summary>
+                                    <pre className="mt-1 text-slate-400 text-[10px] whitespace-pre-wrap">
+                                      {JSON.stringify(truncateLongStrings(log.details.aiCall.request), null, 2)}
+                                    </pre>
+                                  </details>
+                                  <details className="group" open>
+                                    <summary className="cursor-pointer text-emerald-300 text-xs font-semibold">
+                                      {lang === 'en' ? 'AI Response (JSON)' : 'AI 响应 (JSON)'}
+                                    </summary>
+                                    <pre className="mt-1 text-slate-400 text-[10px] whitespace-pre-wrap">
+                                      {JSON.stringify(
+                                        truncateLongStrings(
+                                          log.details.aiCall.error
+                                            ? { error: log.details.aiCall.error }
+                                            : log.details.aiCall.response
+                                        ),
+                                        null,
+                                        2
+                                      )}
+                                    </pre>
+                                  </details>
+                                  {log.details.aiCall.usage && (
+                                    <pre className="text-slate-500 text-[10px] whitespace-pre-wrap">
+                                      {JSON.stringify(truncateLongStrings({ usage: log.details.aiCall.usage, status: log.details.aiCall.status }), null, 2)}
+                                    </pre>
+                                  )}
+                                </div>
+                              ) : log.details.request?.prompt ? (
                                 <div className="space-y-2">
                                   <div className="text-indigo-400 font-semibold text-xs">Request Meta:</div>
                                   <pre className="text-slate-400 text-[10px] whitespace-pre-wrap">
@@ -2129,7 +2433,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
               <Panel defaultSize={15} minSize={10}>
                 <div className="h-full border-r border-slate-200 bg-white flex flex-col">
                   <div className="p-3 border-b border-slate-100 bg-slate-50/50">
-                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Explorer</h2>
+                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{t[lang].fileExplorer}</h2>
                   </div>
                   <div className="flex-1 overflow-y-auto p-2">
                     {fileTree.length > 0 ? (
@@ -2164,7 +2468,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                       <CodeViewer 
                         code={fileContent} 
                         language={getLanguageFromFilename(selectedFile.name)} 
-                        filename={selectedFile.path} 
+                        filename={selectedFile.path}
+                        highlightLine={selectedLine}
                       />
                     )
                   ) : (
@@ -2202,6 +2507,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                         subFunctions={subFunctions} 
                         lang={lang}
                         activeModuleId={activeModuleId}
+                        onOpenSource={handleOpenPanoramaNodeSource}
                       />
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4 p-8 text-center">
@@ -2247,6 +2553,11 @@ Determine if this file is the main entry point. Provide your reasoning.`;
               <Minimize2 className="w-5 h-5" />
             </button>
           </div>
+          <div className="px-4 py-2 border-b border-slate-800 bg-slate-900 text-xs text-slate-300 flex flex-wrap gap-4">
+            <span>{lang === 'en' ? 'AI Calls' : 'AI 调用次数'}: <span className="text-emerald-300">{aiUsageStats.totalCalls}</span></span>
+            <span>{lang === 'en' ? 'Input Tokens' : '输入 Tokens'}: <span className="text-indigo-300">{aiUsageStats.inputTokens}</span></span>
+            <span>{lang === 'en' ? 'Output Tokens' : '输出 Tokens'}: <span className="text-amber-300">{aiUsageStats.outputTokens}</span></span>
+          </div>
           <div className="flex-1 overflow-y-auto p-4 font-mono text-sm">
             {logs.map(log => (
               <div key={log.id} className="flex flex-col mb-2">
@@ -2278,7 +2589,39 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                 </div>
                 {log.expanded && log.details && (
                   <div className="ml-8 mr-4 mb-4 mt-2 p-4 bg-slate-950 rounded-lg border border-slate-800 overflow-x-auto">
-                    {log.details.request?.prompt ? (
+                    {log.details.aiCall ? (
+                      <div className="space-y-3">
+                        <details className="group" open>
+                          <summary className="cursor-pointer text-indigo-300 text-sm font-semibold">
+                            {lang === 'en' ? 'AI Request (Prompt)' : 'AI 请求 (Prompt)'}
+                          </summary>
+                          <pre className="mt-2 text-slate-400 text-xs leading-relaxed whitespace-pre-wrap">
+                            {JSON.stringify(truncateLongStrings(log.details.aiCall.request), null, 2)}
+                          </pre>
+                        </details>
+                        <details className="group" open>
+                          <summary className="cursor-pointer text-emerald-300 text-sm font-semibold">
+                            {lang === 'en' ? 'AI Response (JSON)' : 'AI 响应 (JSON)'}
+                          </summary>
+                          <pre className="mt-2 text-slate-400 text-xs leading-relaxed whitespace-pre-wrap">
+                            {JSON.stringify(
+                              truncateLongStrings(
+                                log.details.aiCall.error
+                                  ? { error: log.details.aiCall.error }
+                                  : log.details.aiCall.response
+                              ),
+                              null,
+                              2
+                            )}
+                          </pre>
+                        </details>
+                        {log.details.aiCall.usage && (
+                          <pre className="text-slate-500 text-xs leading-relaxed whitespace-pre-wrap">
+                            {JSON.stringify(truncateLongStrings({ usage: log.details.aiCall.usage, status: log.details.aiCall.status }), null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    ) : log.details.request?.prompt ? (
                       <div className="space-y-3">
                         <div className="text-indigo-400 font-semibold text-sm">Request Meta:</div>
                         <pre className="text-slate-400 text-xs leading-relaxed whitespace-pre-wrap">

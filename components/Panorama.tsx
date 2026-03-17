@@ -10,6 +10,7 @@ import {
   Position,
   Node,
   Edge,
+  NodeMouseHandler,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { Search, HelpCircle, XCircle } from 'lucide-react';
@@ -70,6 +71,8 @@ type PanoramaNode = {
   parentId?: string;
   name: string;
   file: string;
+  lineStart?: number;
+  lineEnd?: number;
   description_en?: string;
   description_zh?: string;
   drillDown?: number;
@@ -80,14 +83,22 @@ export function Panorama({
   subFunctions,
   lang,
   activeModuleId,
+  onOpenSource,
 }: {
   entryFile: string | null;
   subFunctions: PanoramaNode[];
   lang: 'en' | 'zh';
   activeModuleId?: string | null;
+  onOpenSource?: (node: PanoramaNode) => void;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+
+  const handleNodeClick: NodeMouseHandler<Node> = (_, node) => {
+    if (!onOpenSource) return;
+    if (node.id === 'root') return;
+    onOpenSource(node.data as PanoramaNode);
+  };
 
   useEffect(() => {
     if (!entryFile) {
@@ -197,6 +208,8 @@ export function Panorama({
         data: {
           name: sf.name,
           file: sf.file,
+          lineStart: sf.lineStart,
+          lineEnd: sf.lineEnd,
           description: lang === 'en' ? sf.description_en : sf.description_zh,
           drillDown: sf.drillDown,
           headerColor: (sf as any).moduleColor || '#f8fafc',
@@ -227,6 +240,7 @@ export function Panorama({
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onNodeClick={handleNodeClick}
         nodeTypes={nodeTypes}
         fitView
         minZoom={0.05}

@@ -21,6 +21,8 @@ export type StoredSubFunctionNode = {
   depth: number;
   name: string;
   file: string;
+  lineStart?: number;
+  lineEnd?: number;
   description_en: string;
   description_zh: string;
   drillDown: number;
@@ -76,6 +78,11 @@ export type AnalysisHistoryRecord = {
   subFunctions: StoredSubFunctionNode[];
   functionModules: StoredFunctionModule[];
   agentLogs: StoredLogEntry[];
+  aiUsageStats?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalCalls: number;
+  };
   engineeringMarkdown: string;
 };
 
@@ -219,5 +226,7 @@ export const buildEngineeringMarkdown = (record: Omit<AnalysisHistoryRecord, 'en
     jsonBlock(record.functionModules || []),
     '## Agent Work Logs',
     jsonBlock(record.agentLogs),
+    '## AI Usage Stats',
+    jsonBlock(record.aiUsageStats || { inputTokens: 0, outputTokens: 0, totalCalls: 0 }),
   ].join('\n');
 };
