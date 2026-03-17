@@ -2,13 +2,13 @@
 
 import { useState, useEffect, Suspense, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2 } from 'lucide-react';
+import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2, Layers } from 'lucide-react';
 import { FileTree } from '@/components/FileTree';
 import type { FileNode, GithubNode } from '@/lib/github';
 import { CodeViewer } from '@/components/CodeViewer';
 import { Panorama } from '@/components/Panorama';
 import { parseGithubUrl, buildFileTree, getLanguageFromFilename, getCodeFiles } from '@/lib/github';
-import { buildEngineeringMarkdown, buildHistoryId, getAnalysisHistoryById, saveAnalysisHistoryRecord, type AiAnalysisSnapshot, type AnalysisHistoryRecord, type ConfirmedEntrySnapshot, type RepoInfoSnapshot, type StoredLogEntry, type StoredSubFunctionNode } from '@/lib/analysisHistory';
+import { buildEngineeringMarkdown, buildHistoryId, getAnalysisHistoryById, saveAnalysisHistoryRecord, type AiAnalysisSnapshot, type AnalysisHistoryRecord, type ConfirmedEntrySnapshot, type RepoInfoSnapshot, type StoredFunctionModule, type StoredLogEntry, type StoredSubFunctionNode } from '@/lib/analysisHistory';
 import { GoogleGenAI, Type } from "@google/genai";
 import { Group, Panel, Separator } from 'react-resizable-panels';
 
@@ -45,6 +45,20 @@ type SubFunctionNode = {
   description_en: string;
   description_zh: string;
   drillDown: number;
+  moduleId?: string;
+  moduleName_en?: string;
+  moduleName_zh?: string;
+  moduleColor?: string;
+};
+
+type FunctionModule = {
+  id: string;
+  name_en: string;
+  name_zh: string;
+  description_en: string;
+  description_zh: string;
+  color: string;
+  functionIds: string[];
 };
 
 type LocatedFunction = {
@@ -96,7 +110,15 @@ function AnalyzeContent() {
   const [fileTreeNodes, setFileTreeNodes] = useState<GithubNode[]>([]);
   const [codeFilesList, setCodeFilesList] = useState<string[]>([]);
   const [subFunctions, setSubFunctions] = useState<SubFunctionNode[]>([]);
+  const [functionModules, setFunctionModules] = useState<FunctionModule[]>([]);
+  const [activeModuleId, setActiveModuleId] = useState<string | null>(null);
   const [isAnalyzingSubFunctions, setIsAnalyzingSubFunctions] = useState(false);
+  const [isAnalyzingModules, setIsAnalyzingModules] = useState(false);
+  const [workflowStatus, setWorkflowStatus] = useState<{ state: 'idle' | 'working' | 'completed' | 'error'; label_en: string; label_zh: string }>({
+    state: 'idle',
+    label_en: 'Idle',
+    label_zh: '空闲',
+  });
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showFileTree, setShowFileTree] = useState(true);
   const [showCodeViewer, setShowCodeViewer] = useState(true);
@@ -105,6 +127,7 @@ function AnalyzeContent() {
   const lastSavedHistoryHash = useRef('');
   const fetchIdRef = useRef(0);
   const defaultGeminiApiVersion = "v1beta";
+  const moduleColorPalette = ['#38bdf8', '#34d399', '#f59e0b', '#f97316', '#a78bfa', '#fb7185', '#2dd4bf', '#84cc16', '#eab308', '#60a5fa'];
 
   const resolveGeminiEndpoint = () => {
     const rawBaseUrl =
@@ -199,6 +222,14 @@ function AnalyzeContent() {
       details: item.details,
       expanded: false,
     }));
+  };
+
+  const setWorkflow = (
+    state: 'idle' | 'working' | 'completed' | 'error',
+    label_en: string,
+    label_zh: string
+  ) => {
+    setWorkflowStatus({ state, label_en, label_zh });
   };
 
   const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
@@ -836,11 +867,16 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
     currentFetchId: number,
     repo: RepoRef,
     targetUrl: string,
-    projectSummary: string,
+    analysisContext: {
+      summary_en: string;
+      primaryLanguage_en: string;
+      techStack: string[];
+    },
     allFiles: string[]
   ) => {
     if (currentFetchId !== fetchIdRef.current) return;
     setIsAnalyzingSubFunctions(true);
+    setWorkflow('working', 'AI is analyzing call chain...', 'AI 正在分析调用链...');
     setSubFunctions([]);
     addLog(
       { en: 'Starting recursive sub-function analysis...', zh: '开始递归分析子函数...' },
@@ -878,7 +914,7 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
         const fileList = allFiles.slice(0, 1500).join('\n');
         const prompt = `Analyze the function below and identify up to 12 key child function calls.
 Project URL: ${targetUrl}
-Project Summary: ${projectSummary}
+Project Summary: ${analysisContext.summary_en}
 Caller Function: ${functionName}
 Caller File: ${functionFile}
 Depth: ${depth}/${maxDepth}
@@ -1027,6 +1063,8 @@ For each child function return:
         'success',
         { maxDepth, totalNodes: allResults.length }
       );
+
+      await analyzeFunctionModules(allResults, currentFetchId, targetUrl, analysisContext);
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
       addLog(
@@ -1040,9 +1078,186 @@ For each child function return:
     }
   };
 
+  const analyzeFunctionModules = async (
+    nodes: SubFunctionNode[],
+    currentFetchId: number,
+    targetUrl: string,
+    analysisContext: {
+      summary_en: string;
+      primaryLanguage_en: string;
+      techStack: string[];
+    }
+  ) => {
+    if (currentFetchId !== fetchIdRef.current) return;
+    if (!nodes.length) return;
+
+    setIsAnalyzingModules(true);
+    setWorkflow('working', 'AI is grouping function modules...', 'AI 正在划分功能模块...');
+    addLog({ en: 'Starting function module grouping...', zh: '开始进行函数模块划分...' }, 'info');
+
+    try {
+      const ai = createGeminiClient();
+      if (!ai) {
+        setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
+        return;
+      }
+
+      const endpoint = resolveGeminiEndpoint();
+      const compactNodes = nodes.slice(0, 1200).map((node) => ({
+        id: node.id,
+        name: node.name,
+        file: node.file,
+        description_en: node.description_en,
+        description_zh: node.description_zh,
+      }));
+
+      const prompt = `Group the following function nodes into high-level functional modules for a GitHub project.
+Project URL: ${targetUrl}
+Project Summary(EN): ${analysisContext.summary_en}
+Primary Language(EN): ${analysisContext.primaryLanguage_en}
+Tech Stack: ${analysisContext.techStack.join(', ')}
+
+Rules:
+1) Create at most 10 modules.
+2) Every function node id must be assigned to one module.
+3) Return module names/descriptions in English and Chinese.
+4) functionIds must only use node ids from the input list.
+
+Function Nodes JSON:
+${JSON.stringify(compactNodes)}`;
+
+      addLog(
+        { en: 'AI Request Payload for module grouping', zh: '模块划分的 AI 请求数据' },
+        'info',
+        {
+          request: {
+            model: 'gemini-3.1-pro-preview',
+            baseUrl: endpoint.baseUrl,
+            apiVersion: endpoint.apiVersion,
+            url: `${endpoint.requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
+            nodeCount: compactNodes.length,
+            prompt,
+          },
+        }
+      );
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              modules: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    name_en: { type: Type.STRING },
+                    name_zh: { type: Type.STRING },
+                    description_en: { type: Type.STRING },
+                    description_zh: { type: Type.STRING },
+                    functionIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  },
+                  required: ['id', 'name_en', 'name_zh', 'description_en', 'description_zh', 'functionIds'],
+                },
+              },
+            },
+            required: ['modules'],
+          },
+        },
+      });
+
+      if (currentFetchId !== fetchIdRef.current) return;
+      if (!response.text) {
+        setWorkflow('completed', 'Workflow completed', '工作流已完成');
+        return;
+      }
+
+      const parsed = JSON.parse(response.text);
+      const rawModules = Array.isArray(parsed?.modules) ? parsed.modules.slice(0, 10) : [];
+
+      const modules: FunctionModule[] = rawModules.map((item: any, index: number) => ({
+        id: item.id || `module-${index + 1}`,
+        name_en: item.name_en || `Module ${index + 1}`,
+        name_zh: item.name_zh || `模块 ${index + 1}`,
+        description_en: item.description_en || '',
+        description_zh: item.description_zh || '',
+        color: moduleColorPalette[index % moduleColorPalette.length],
+        functionIds: Array.isArray(item.functionIds) ? item.functionIds : [],
+      }));
+
+      const moduleByFunctionId = new Map<string, FunctionModule>();
+      for (const funcModule of modules) {
+        for (const fnId of funcModule.functionIds) {
+          moduleByFunctionId.set(fnId, funcModule);
+        }
+      }
+
+      const enrichedNodes = nodes.map((node) => {
+        const matched = moduleByFunctionId.get(node.id);
+        if (!matched) return node;
+        return {
+          ...node,
+          moduleId: matched.id,
+          moduleName_en: matched.name_en,
+          moduleName_zh: matched.name_zh,
+          moduleColor: matched.color,
+        };
+      });
+
+      setFunctionModules(modules);
+      setSubFunctions(enrichedNodes);
+      setActiveModuleId(null);
+
+      addLog(
+        { en: `Function modules grouped: ${modules.length}`, zh: `函数模块划分完成，共 ${modules.length} 个模块` },
+        'success',
+        { response: { modules } }
+      );
+      setWorkflow('completed', 'Workflow completed', '工作流已完成');
+    } catch (err: any) {
+      if (currentFetchId !== fetchIdRef.current) return;
+      setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
+      addLog({ en: `Function module grouping failed: ${err.message}`, zh: `函数模块划分失败: ${err.message}` }, 'error');
+    } finally {
+      if (currentFetchId === fetchIdRef.current) {
+        setIsAnalyzingModules(false);
+      }
+    }
+  };
+
+  const handleReanalyzeModules = async () => {
+    if (!subFunctions.length) {
+      addLog(
+        { en: 'Cannot re-analyze modules: no function nodes yet.', zh: '无法重新分析模块：当前没有函数节点。' },
+        'warning'
+      );
+      return;
+    }
+
+    if (!aiAnalysis) {
+      addLog(
+        { en: 'Cannot re-analyze modules: missing project AI summary.', zh: '无法重新分析模块：缺少项目 AI 摘要。' },
+        'warning'
+      );
+      return;
+    }
+
+    await analyzeFunctionModules(subFunctions, fetchIdRef.current, url, {
+      summary_en: aiAnalysis.summary_en,
+      primaryLanguage_en: aiAnalysis.primaryLanguage_en,
+      techStack: aiAnalysis.techStack || [],
+    });
+  };
+
   const verifyEntryFiles = async (analysisResult: any, currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string, allFiles: string[]) => {
     addLog({ en: 'Starting entry file verification...', zh: '开始验证入口文件...' }, 'info');
+    setWorkflow('working', 'AI is verifying entry files...', 'AI 正在验证入口文件...');
     setIsVerifyingEntry(true);
+    let foundEntry = false;
 
     try {
       const ai = createGeminiClient();
@@ -1124,6 +1339,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             }, result.isEntryFile ? 'success' : 'info', { result });
 
             if (result.isEntryFile) {
+              foundEntry = true;
               setConfirmedEntryFile({
                 path: filePath,
                 reason_en: result.reason_en,
@@ -1132,7 +1348,18 @@ Determine if this file is the main entry point. Provide your reasoning.`;
               addLog({ en: `Found main entry file: ${filePath}`, zh: `找到主入口文件: ${filePath}` }, 'success');
 
               // Trigger recursive sub-function analysis
-              analyzeSubFunctionsRecursive(filePath, currentFetchId, repo, targetUrl, analysisResult.summary_en, allFiles);
+              analyzeSubFunctionsRecursive(
+                filePath,
+                currentFetchId,
+                repo,
+                targetUrl,
+                {
+                  summary_en: analysisResult.summary_en,
+                  primaryLanguage_en: analysisResult.primaryLanguage_en,
+                  techStack: analysisResult.techStack || [],
+                },
+                allFiles
+              );
 
               break; // Stop checking other files
             }
@@ -1145,6 +1372,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
               { githubError: err.details }
             );
           } else {
+            setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
             addLog({ en: `Error verifying ${filePath}: ${err.message}`, zh: `验证 ${filePath} 时出错: ${err.message}` }, 'error');
           }
         }
@@ -1152,6 +1380,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } finally {
       if (currentFetchId === fetchIdRef.current) {
         setIsVerifyingEntry(false);
+        if (!foundEntry) {
+          setWorkflow('completed', 'Workflow completed (entry not confirmed)', '工作流结束（未确认入口文件）');
+        }
       }
     }
   };
@@ -1160,11 +1391,13 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setIsAnalyzing(true);
     setAiAnalysis(null);
     setConfirmedEntryFile(null);
+    setWorkflow('working', 'AI is analyzing repository...', 'AI 正在分析仓库...');
     addLog({ en: 'Starting AI analysis...', zh: '开始 AI 分析...' }, 'info');
     try {
       const ai = createGeminiClient();
       if (!ai) {
         console.warn("Gemini API key not found");
+        setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
         addLog({ en: 'Gemini API key not found.', zh: '未找到 Gemini API 密钥。' }, 'error');
         return;
       }
@@ -1218,6 +1451,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
       console.error("AI Analysis failed:", err);
+      setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
       addLog({ en: `AI analysis failed: ${err.message}`, zh: `AI 分析失败: ${err.message}` }, 'error', { error: err });
     } finally {
       if (currentFetchId === fetchIdRef.current) {
@@ -1229,6 +1463,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   const fetchRepoData = async (targetUrl: string) => {
     const currentFetchId = ++fetchIdRef.current;
     
+    setWorkflow('working', 'Starting workflow...', '工作流启动中...');
     setLoading(true);
     setError('');
     setFileTree([]);
@@ -1242,12 +1477,16 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setFileTreeNodes([]);
     setCodeFilesList([]);
     setSubFunctions([]);
+    setFunctionModules([]);
+    setActiveModuleId(null);
+    setIsAnalyzingModules(false);
 
     addLog({ en: `Validating GitHub URL: ${targetUrl}`, zh: `校验 GitHub URL: ${targetUrl}` }, 'info');
     const parsed = parseGithubUrl(targetUrl);
     if (!parsed) {
       if (currentFetchId !== fetchIdRef.current) return;
       setError(lang === 'en' ? 'Invalid GitHub URL' : '无效的 GitHub URL');
+      setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
       addLog({ en: 'Invalid GitHub URL format.', zh: '无效的 GitHub URL 格式。' }, 'error');
       setLoading(false);
       return;
@@ -1300,17 +1539,21 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       addLog({ en: `Filtered code files: ${codeFiles.length} files found.`, zh: `过滤后的代码文件: 找到 ${codeFiles.length} 个文件。` }, 'info', { files: codeFiles });
       if (codeFiles.length > 0) {
         analyzeWithAI(codeFiles, currentFetchId, { owner: parsed.owner, repo: parsed.repo, branch: branch || 'main' }, targetUrl);
+      } else {
+        setWorkflow('completed', 'Workflow completed (no code files)', '工作流结束（未找到代码文件）');
       }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
       setError(err.message || 'An error occurred while fetching data');
       if (err instanceof GithubRequestError) {
+        setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
         addLog(
           { en: `Error: ${err.message}`, zh: `错误: ${err.message}` },
           'error',
           { githubError: err.details }
         );
       } else {
+        setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
         addLog({ en: `Error: ${err.message}`, zh: `错误: ${err.message}` }, 'error');
       }
     } finally {
@@ -1340,6 +1583,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setIsAnalyzing(false);
     setIsVerifyingEntry(false);
     setIsAnalyzingSubFunctions(false);
+    setIsAnalyzingModules(false);
     setSelectedFile(null);
     setFileContent('');
     setContentLoading(false);
@@ -1352,7 +1596,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setFileTreeNodes(record.fileTreeNodes || []);
     setFileTree(buildFileTree(record.fileTreeNodes || []));
     setSubFunctions((record.subFunctions || []) as SubFunctionNode[]);
+    setFunctionModules((record.functionModules || []) as FunctionModule[]);
+    setActiveModuleId(null);
     setLogs(hydrateLogs(record.agentLogs || []));
+    setWorkflow('completed', 'Loaded from history', '已加载历史记录');
 
     lastFetchedUrl.current = record.projectUrl;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1385,6 +1632,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       codeFiles: codeFilesList,
       fileTreeNodes,
       subFunctions,
+      functionModules,
       agentLogs: serializedLogs,
     };
 
@@ -1398,6 +1646,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       savedAt,
       fileTreeNodes: fileTreeNodes as GithubNode[],
       subFunctions: subFunctions as StoredSubFunctionNode[],
+      functionModules: functionModules as StoredFunctionModule[],
     };
 
     const nextRecord: AnalysisHistoryRecord = {
@@ -1410,7 +1659,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } catch (err) {
       console.warn('Failed to save analysis history:', err);
     }
-  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, logs]);
+  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs]);
 
   const t = {
     en: {
@@ -1438,7 +1687,11 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       errorLoading: 'Error loading file',
       confirmedEntry: 'Confirmed Entry File',
       verifyingEntry: 'Verifying entry files...',
-      entryReason: 'Verification Reason'
+      entryReason: 'Verification Reason',
+      moduleList: 'Function Modules',
+      allModules: 'All Modules',
+      workflowStatus: 'Workflow Status',
+      reanalyzeModules: 'Re-analyze Modules'
     },
     zh: {
       title: 'GitHub 代码分析器',
@@ -1465,7 +1718,11 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       errorLoading: '加载文件出错',
       confirmedEntry: '已确认的主入口',
       verifyingEntry: '正在验证入口文件...',
-      entryReason: '验证理由'
+      entryReason: '验证理由',
+      moduleList: '功能模块列表',
+      allModules: '全部模块',
+      workflowStatus: '工作流状态',
+      reanalyzeModules: '重新分析模块'
     }
   };
 
@@ -1557,7 +1814,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             className="flex items-center px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-100 transition-colors shadow-sm"
           >
             <Languages className="w-4 h-4 mr-1.5 text-indigo-500" />
-            {lang === 'en' ? '涓枃' : 'English'}
+            {lang === 'en' ? '中文' : 'English'}
           </button>
         </div>
       </header>
@@ -1601,6 +1858,17 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                     <div className="flex items-center">
                       <Terminal className="w-4 h-4 text-slate-500 mr-2" />
                       <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{t[lang].systemLogs}</h2>
+                      <span className={`ml-2 px-2 py-0.5 rounded-full text-[10px] border ${
+                        workflowStatus.state === 'working'
+                          ? 'bg-indigo-50 border-indigo-200 text-indigo-600'
+                          : workflowStatus.state === 'completed'
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
+                            : workflowStatus.state === 'error'
+                              ? 'bg-rose-50 border-rose-200 text-rose-600'
+                              : 'bg-slate-50 border-slate-200 text-slate-500'
+                      }`}>
+                        {lang === 'en' ? workflowStatus.label_en : workflowStatus.label_zh}
+                      </span>
                     </div>
                     <button 
                       onClick={() => setIsLogsFullscreen(true)}
@@ -1679,6 +1947,78 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                   </div>
                 </div>
               )}
+
+              <div className="mb-6 space-y-3">
+                <div>
+                  <div className="flex items-center mb-2">
+                    <Info className="w-4 h-4 text-slate-500 mr-2" />
+                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{t[lang].workflowStatus}</h2>
+                  </div>
+                  <div className={`rounded-lg border px-3 py-2 text-sm font-medium ${
+                    workflowStatus.state === 'working'
+                      ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
+                      : workflowStatus.state === 'completed'
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : workflowStatus.state === 'error'
+                          ? 'bg-rose-50 border-rose-200 text-rose-700'
+                          : 'bg-slate-50 border-slate-200 text-slate-600'
+                  }`}>
+                    {lang === 'en' ? workflowStatus.label_en : workflowStatus.label_zh}
+                    {(isAnalyzing || isVerifyingEntry || isAnalyzingSubFunctions || isAnalyzingModules) && (
+                      <Loader2 className="w-3.5 h-3.5 inline ml-2 animate-spin" />
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center mb-2">
+                    <Layers className="w-4 h-4 text-slate-500 mr-2" />
+                    <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{t[lang].moduleList}</h2>
+                  </div>
+                  <button
+                    onClick={handleReanalyzeModules}
+                    disabled={isAnalyzingModules || !subFunctions.length || !aiAnalysis}
+                    className="mb-3 w-full px-3 py-2 rounded-lg text-xs font-medium border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isAnalyzingModules ? (
+                      <span className="inline-flex items-center">
+                        <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                        {lang === 'en' ? 'Analyzing...' : '分析中...'}
+                      </span>
+                    ) : (
+                      t[lang].reanalyzeModules
+                    )}
+                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => setActiveModuleId(null)}
+                      className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                        activeModuleId === null
+                          ? 'bg-slate-900 text-white border-slate-900'
+                          : 'bg-white text-slate-600 border-slate-300 hover:border-slate-400'
+                      }`}
+                    >
+                      {t[lang].allModules}
+                    </button>
+                    {functionModules.map((module) => (
+                      <button
+                        key={module.id}
+                        onClick={() => setActiveModuleId((prev) => (prev === module.id ? null : module.id))}
+                        className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                          activeModuleId === module.id ? 'text-white border-transparent' : 'text-slate-800'
+                        }`}
+                        style={{
+                          backgroundColor: activeModuleId === module.id ? module.color : `${module.color}26`,
+                          borderColor: module.color,
+                        }}
+                        title={lang === 'en' ? module.description_en : module.description_zh}
+                      >
+                        {(lang === 'en' ? module.name_en : module.name_zh) + ` (${module.functionIds.length})`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
 
               <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">{t[lang].projectInfo}</h2>
               {loading ? (
@@ -1860,7 +2200,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                       <Panorama 
                         entryFile={confirmedEntryFile?.path || null} 
                         subFunctions={subFunctions} 
-                        lang={lang} 
+                        lang={lang}
+                        activeModuleId={activeModuleId}
                       />
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4 p-8 text-center">
@@ -1887,6 +2228,17 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             <div className="flex items-center">
               <Terminal className="w-5 h-5 text-slate-400 mr-3" />
               <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">{t[lang].systemLogs}</h2>
+              <span className={`ml-3 px-2 py-0.5 rounded-full text-[10px] border ${
+                workflowStatus.state === 'working'
+                  ? 'bg-indigo-950 border-indigo-700 text-indigo-300'
+                  : workflowStatus.state === 'completed'
+                    ? 'bg-emerald-950 border-emerald-700 text-emerald-300'
+                    : workflowStatus.state === 'error'
+                      ? 'bg-rose-950 border-rose-700 text-rose-300'
+                      : 'bg-slate-900 border-slate-700 text-slate-400'
+              }`}>
+                {lang === 'en' ? workflowStatus.label_en : workflowStatus.label_zh}
+              </span>
             </div>
             <button 
               onClick={() => setIsLogsFullscreen(false)}

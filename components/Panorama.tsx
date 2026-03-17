@@ -3,6 +3,7 @@ import {
   ReactFlow,
   Controls,
   Background,
+  MiniMap,
   useNodesState,
   useEdgesState,
   Handle,
@@ -14,11 +15,26 @@ import '@xyflow/react/dist/style.css';
 import { Search, HelpCircle, XCircle } from 'lucide-react';
 
 const CustomNode = ({ data }: any) => {
+  const isDimmed = Boolean(data.dimmed);
+  const headerBg = data.headerColor || '#f8fafc';
+  const headerText = data.headerTextColor || '#334155';
+  const borderColor = data.borderColor || '#1e293b';
+
   return (
-    <div className="bg-white border-2 border-slate-800 rounded-xl shadow-sm min-w-[200px] max-w-[250px] overflow-hidden">
+    <div
+      className="bg-white border-2 rounded-xl shadow-sm min-w-[200px] max-w-[250px] overflow-hidden transition-all"
+      style={{
+        borderColor,
+        opacity: isDimmed ? 0.35 : 1,
+        filter: isDimmed ? 'grayscale(0.7)' : 'none',
+      }}
+    >
       <Handle type="target" position={Position.Left} className="w-2 h-2 !bg-slate-800" />
-      <div className="px-3 py-1.5 border-b-2 border-slate-800 bg-slate-50 flex items-center justify-between">
-        <span className="text-xs font-semibold text-slate-700 truncate mr-2">{data.file}</span>
+      <div
+        className="px-3 py-1.5 border-b-2 flex items-center justify-between"
+        style={{ backgroundColor: headerBg, borderColor, color: headerText }}
+      >
+        <span className="text-xs font-semibold truncate mr-2">{data.file}</span>
         {data.drillDown !== undefined && (
           <div
             className="shrink-0"
@@ -63,10 +79,12 @@ export function Panorama({
   entryFile,
   subFunctions,
   lang,
+  activeModuleId,
 }: {
   entryFile: string | null;
   subFunctions: PanoramaNode[];
   lang: 'en' | 'zh';
+  activeModuleId?: string | null;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -159,6 +177,10 @@ export function Panorama({
         name: lang === 'en' ? 'Main Entry' : '主入口函数',
         file: entryFile,
         description: lang === 'en' ? 'The main entry point of the project.' : '项目的主入口函数。',
+        headerColor: '#f1f5f9',
+        headerTextColor: '#334155',
+        borderColor: '#334155',
+        dimmed: Boolean(activeModuleId),
       },
     });
 
@@ -177,6 +199,10 @@ export function Panorama({
           file: sf.file,
           description: lang === 'en' ? sf.description_en : sf.description_zh,
           drillDown: sf.drillDown,
+          headerColor: (sf as any).moduleColor || '#f8fafc',
+          headerTextColor: '#0f172a',
+          borderColor: (sf as any).moduleColor || '#1e293b',
+          dimmed: Boolean(activeModuleId && (sf as any).moduleId !== activeModuleId),
         },
       });
 
@@ -192,7 +218,7 @@ export function Panorama({
 
     setNodes(newNodes);
     setEdges(newEdges);
-  }, [entryFile, subFunctions, lang, setNodes, setEdges]);
+  }, [entryFile, subFunctions, lang, activeModuleId, setNodes, setEdges]);
 
   return (
     <div className="w-full h-full bg-slate-50/50">
@@ -203,9 +229,18 @@ export function Panorama({
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         fitView
+        minZoom={0.05}
+        maxZoom={2}
         attributionPosition="bottom-right"
       >
         <Background color="#cbd5e1" gap={16} />
+        <MiniMap
+          pannable
+          zoomable
+          nodeStrokeWidth={2}
+          maskColor="rgba(15, 23, 42, 0.08)"
+          style={{ backgroundColor: '#f8fafc', border: '1px solid #cbd5e1' }}
+        />
         <Controls />
       </ReactFlow>
     </div>

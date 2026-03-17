@@ -24,6 +24,20 @@ export type StoredSubFunctionNode = {
   description_en: string;
   description_zh: string;
   drillDown: number;
+  moduleId?: string;
+  moduleName_en?: string;
+  moduleName_zh?: string;
+  moduleColor?: string;
+};
+
+export type StoredFunctionModule = {
+  id: string;
+  name_en: string;
+  name_zh: string;
+  description_en: string;
+  description_zh: string;
+  color: string;
+  functionIds: string[];
 };
 
 export type RepoInfoSnapshot = {
@@ -60,6 +74,7 @@ export type AnalysisHistoryRecord = {
   codeFiles: string[];
   fileTreeNodes: GithubNode[];
   subFunctions: StoredSubFunctionNode[];
+  functionModules: StoredFunctionModule[];
   agentLogs: StoredLogEntry[];
   engineeringMarkdown: string;
 };
@@ -200,6 +215,8 @@ export const buildEngineeringMarkdown = (record: Omit<AnalysisHistoryRecord, 'en
     jsonBlock(record.codeFiles),
     '## Full Call Chain',
     jsonBlock(record.subFunctions),
+    '## Function Modules',
+    jsonBlock(record.functionModules || []),
     '## Agent Work Logs',
     jsonBlock(record.agentLogs),
   ].join('\n');
