@@ -1,6 +1,6 @@
 ﻿'use client';
 
-import { useState, useEffect, Suspense, useRef } from 'react';
+import { useState, useEffect, Suspense, useRef, useMemo } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2, Layers } from 'lucide-react';
 import { FileTree } from '@/components/FileTree';
@@ -132,6 +132,7 @@ function AnalyzeContent() {
   const [showCodeViewer, setShowCodeViewer] = useState(true);
   const [showPanorama, setShowPanorama] = useState(true);
   const [selectedLine, setSelectedLine] = useState<number | null>(null);
+  const [isMarkdownFullscreen, setIsMarkdownFullscreen] = useState(false);
   const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>({ inputTokens: 0, outputTokens: 0, totalCalls: 0 });
   const lastFetchedUrl = useRef('');
   const lastSavedHistoryHash = useRef('');
@@ -1871,6 +1872,31 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     }
   }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs, aiUsageStats]);
 
+  const engineeringMarkdownPreview = useMemo(() => {
+    if (!repoInfo && !aiAnalysis && !subFunctions.length && !logs.length) return '';
+
+    const projectName = repoInfo ? `${repoInfo.owner}/${repoInfo.repo}` : 'Unknown Project';
+    const baseRecord: Omit<AnalysisHistoryRecord, 'engineeringMarkdown'> = {
+      id: buildHistoryId((repoInfo as RepoInfoSnapshot | null) || null, url || projectName),
+      savedAt: new Date().toISOString(),
+      projectName,
+      projectUrl: url || '',
+      lang,
+      repoInfo,
+      aiAnalysis,
+      confirmedEntryFile,
+      allFilePaths,
+      codeFiles: codeFilesList,
+      fileTreeNodes: fileTreeNodes as GithubNode[],
+      subFunctions: subFunctions as StoredSubFunctionNode[],
+      functionModules: functionModules as StoredFunctionModule[],
+      agentLogs: serializeLogs(logs),
+      aiUsageStats,
+    };
+
+    return buildEngineeringMarkdown(baseRecord);
+  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs, aiUsageStats]);
+
   const t = {
     en: {
       title: 'GitHub Code Analyzer',
@@ -1901,7 +1927,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       moduleList: 'Function Modules',
       allModules: 'All Modules',
       workflowStatus: 'Workflow Status',
-      reanalyzeModules: 'Re-analyze Modules'
+      reanalyzeModules: 'Re-analyze Modules',
+      engineeringFile: 'Engineering File',
+      markdownNotAvailable: 'Engineering markdown is not available yet.'
     },
     zh: {
       title: 'GitHub 代码分析器',
@@ -1932,7 +1960,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       moduleList: '功能模块列表',
       allModules: '全部模块',
       workflowStatus: '工作流状态',
-      reanalyzeModules: '重新分析模块'
+      reanalyzeModules: '重新分析模块',
+      engineeringFile: '工程文件',
+      markdownNotAvailable: '工程 Markdown 文件暂不可用。'
     }
   };
 
@@ -2412,6 +2442,26 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                           <div className="text-xs font-medium text-slate-500 mb-1 uppercase tracking-wider">{t[lang].projectSummary}</div>
                           <div className="text-sm text-slate-700 leading-relaxed">{lang === 'en' ? aiAnalysis.summary_en : aiAnalysis.summary_zh}</div>
                         </div>
+
+                        <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="text-xs font-medium text-slate-500 uppercase tracking-wider">{t[lang].engineeringFile}</div>
+                            <button
+                              onClick={() => setIsMarkdownFullscreen(true)}
+                              className="p-1 hover:bg-slate-100 rounded text-slate-500 transition-colors"
+                              title="Fullscreen"
+                            >
+                              <Maximize2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                          {engineeringMarkdownPreview ? (
+                            <pre className="max-h-56 overflow-auto p-2 bg-slate-50 border border-slate-200 rounded text-[11px] leading-relaxed text-slate-700 whitespace-pre-wrap">
+                              {engineeringMarkdownPreview}
+                            </pre>
+                          ) : (
+                            <div className="text-xs text-slate-400">{t[lang].markdownNotAvailable}</div>
+                          )}
+                        </div>
                       </div>
                     ) : (
                       <div className="p-4 border border-dashed border-slate-300 rounded-lg text-center bg-slate-50/50">
@@ -2654,6 +2704,29 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                 )}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {isMarkdownFullscreen && (
+        <div className="fixed inset-0 z-50 bg-white flex flex-col">
+          <div className="flex items-center justify-between p-4 border-b border-slate-200 bg-slate-50">
+            <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">{t[lang].engineeringFile}</h2>
+            <button
+              onClick={() => setIsMarkdownFullscreen(false)}
+              className="p-2 hover:bg-slate-200 rounded text-slate-500 transition-colors"
+            >
+              <Minimize2 className="w-5 h-5" />
+            </button>
+          </div>
+          <div className="flex-1 overflow-auto p-4">
+            {engineeringMarkdownPreview ? (
+              <pre className="w-full h-full bg-slate-50 border border-slate-200 rounded p-4 text-sm leading-relaxed text-slate-700 whitespace-pre-wrap">
+                {engineeringMarkdownPreview}
+              </pre>
+            ) : (
+              <div className="text-sm text-slate-400">{t[lang].markdownNotAvailable}</div>
+            )}
           </div>
         </div>
       )}
