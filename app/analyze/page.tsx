@@ -1131,6 +1131,234 @@ ${fileList}`;
     return seeds;
   };
 
+  const toDisplayRoutePath = (value: string) => {
+    const raw = (value || '').trim();
+    if (!raw) return '/';
+    if (raw.startsWith('^')) return raw;
+    return raw.startsWith('/') ? raw : `/${raw}`;
+  };
+
+  const extractPythonBlockSnippet = (fileText: string, matchIndex: number) => {
+    const lines = fileText.split('\n');
+    let charCount = 0;
+    let startLine = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const lineLen = lines[i].length + 1;
+      if (charCount + lineLen > matchIndex) {
+        startLine = i;
+        break;
+      }
+      charCount += lineLen;
+    }
+
+    const maxEnd = Math.min(lines.length - 1, startLine + 220);
+    const startText = lines[startLine] || '';
+    const baseIndent = (startText.match(/^\s*/) || [''])[0].length;
+    let endLine = maxEnd;
+
+    for (let i = startLine + 1; i <= maxEnd; i++) {
+      const line = lines[i] || '';
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const indent = (line.match(/^\s*/) || [''])[0].length;
+      if (indent <= baseIndent && !trimmed.startsWith('@')) {
+        endLine = i - 1;
+        break;
+      }
+    }
+
+    if (endLine < startLine) endLine = startLine;
+    return {
+      code: lines.slice(startLine, endLine + 1).join('\n'),
+      lineStart: startLine + 1,
+      lineEnd: endLine + 1,
+    };
+  };
+
+  const parsePythonRouteDecorators = (filePath: string, fileText: string): BridgeSeed[] => {
+    const seeds: BridgeSeed[] = [];
+    const blockRe = /((?:^\s*@.*\n)+)\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*:/gm;
+    let match: RegExpExecArray | null = null;
+
+    while ((match = blockRe.exec(fileText)) !== null) {
+      const decoratorsRaw = match[1] || '';
+      const functionName = match[2] || '';
+      if (!decoratorsRaw || !functionName) continue;
+
+      const decoratorLines = decoratorsRaw
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('@'));
+      const routeDisplays: string[] = [];
+
+      for (const dec of decoratorLines) {
+        const flaskRouteMatch = dec.match(/@\w[\w.]*\.route\(\s*(['"])(.*?)\1([\s\S]*?)\)/);
+        if (flaskRouteMatch) {
+          const routePath = toDisplayRoutePath(flaskRouteMatch[2] || '/');
+          const argRest = flaskRouteMatch[3] || '';
+          const methodsMatch = argRest.match(/methods\s*=\s*\[([^\]]+)\]/i);
+          const methods = methodsMatch
+            ? Array.from((methodsMatch[1] || '').matchAll(/['"]([A-Za-z]+)['"]/g)).map((m) => (m[1] || '').toUpperCase())
+            : ['GET'];
+          const normalizedMethods = methods.length ? methods : ['GET'];
+          for (const method of normalizedMethods) {
+            routeDisplays.push(`${method} ${routePath}`);
+          }
+          continue;
+        }
+
+        const fastApiMatch = dec.match(/@\w[\w.]*\.(get|post|put|delete|patch|options|head|trace)\(\s*(['"])(.*?)\2/i);
+        if (fastApiMatch) {
+          const method = (fastApiMatch[1] || '').toUpperCase();
+          const routePath = toDisplayRoutePath(fastApiMatch[3] || '/');
+          routeDisplays.push(`${method} ${routePath}`);
+        }
+      }
+
+      if (!routeDisplays.length) continue;
+      const snippet = extractPythonBlockSnippet(fileText, match.index);
+      seeds.push({
+        name: functionName,
+        file: filePath,
+        code: snippet.code,
+        lineStart: snippet.lineStart,
+        lineEnd: snippet.lineEnd,
+        description_en: 'Python web route handler (Flask/FastAPI).',
+        description_zh: 'Python Web 路由处理函数（Flask/FastAPI）。',
+        drillDown: 1,
+        routePath: Array.from(new Set(routeDisplays)).join(' | '),
+        bridgeSource: 'python-web-route',
+      });
+    }
+
+    return seeds;
+  };
+
+  const parseDjangoUrlMappings = (urlsText: string) => {
+    const mappings: Array<{ route: string; targetExpr: string; symbolName: string }> = [];
+    const mappingRe = /\b(?:path|re_path)\(\s*(['"])(.*?)\1\s*,\s*([^,\n]+(?:\([^)]*\))?)/g;
+    let match: RegExpExecArray | null = null;
+
+    while ((match = mappingRe.exec(urlsText)) !== null) {
+      const route = match[2] || '';
+      const targetExpr = (match[3] || '').trim();
+      if (!targetExpr) continue;
+
+      let symbolName = '';
+      const classViewMatch = targetExpr.match(/([A-Za-z_]\w*)\.as_view\s*\(/);
+      if (classViewMatch?.[1]) {
+        symbolName = classViewMatch[1];
+      } else {
+        const cleaned = targetExpr.replace(/\([^)]*\)/g, '').trim();
+        const leafMatch = cleaned.match(/([A-Za-z_]\w*)$/);
+        symbolName = leafMatch?.[1] || '';
+      }
+
+      if (!symbolName) continue;
+      mappings.push({ route, targetExpr, symbolName });
+    }
+
+    return mappings;
+  };
+
+  const findPythonCallableInFile = (fileText: string, symbolName: string): LocatedFunction | null => {
+    const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = [
+      new RegExp(`^\\s*def\\s+${escaped}\\s*\\(`, 'm'),
+      new RegExp(`^\\s*class\\s+${escaped}\\b`, 'm'),
+    ];
+
+    for (const re of patterns) {
+      const match = re.exec(fileText);
+      if (match?.index !== undefined) {
+        const snippet = extractPythonBlockSnippet(fileText, match.index);
+        return {
+          file: '',
+          code: snippet.code,
+          lineStart: snippet.lineStart,
+          lineEnd: snippet.lineEnd,
+        };
+      }
+    }
+    return null;
+  };
+
+  const collectDjangoBridgeSeeds = async (
+    inputCtx: BridgeDetectionContext,
+    fetchId: number
+  ): Promise<BridgeSeed[]> => {
+    const urlFiles = inputCtx.allFiles.filter((file) => file.toLowerCase().endsWith('urls.py')).slice(0, 80);
+    if (!urlFiles.length) return [];
+
+    const contentCache = new Map<string, string>();
+    const getFileContent = async (path: string) => {
+      if (contentCache.has(path)) return contentCache.get(path) || '';
+      const content = await fetchFileText(inputCtx.repo, path);
+      if (!content) return '';
+      contentCache.set(path, content.text);
+      return content.text;
+    };
+
+    const viewFiles = inputCtx.allFiles.filter((file) => {
+      const lower = file.toLowerCase();
+      return lower.endsWith('.py') && (lower.endsWith('/views.py') || lower.includes('/views/'));
+    });
+
+    const seeds: BridgeSeed[] = [];
+    for (const urlsFile of urlFiles) {
+      if (fetchId !== fetchIdRef.current) return [];
+      let urlsText = '';
+      try {
+        urlsText = await getFileContent(urlsFile);
+      } catch {
+        continue;
+      }
+      if (!urlsText) continue;
+
+      const mappings = parseDjangoUrlMappings(urlsText);
+      if (!mappings.length) continue;
+
+      const dir = urlsFile.includes('/') ? urlsFile.slice(0, urlsFile.lastIndexOf('/')) : '';
+      const sameDirView = dir ? `${dir}/views.py` : 'views.py';
+
+      for (const mapping of mappings) {
+        if (fetchId !== fetchIdRef.current) return [];
+        const candidateFiles = Array.from(
+          new Set(
+            [sameDirView, ...viewFiles.filter((f) => (dir ? f.startsWith(dir) : true))]
+          )
+        ).slice(0, 50);
+
+        for (const candidate of candidateFiles) {
+          try {
+            const viewText = await getFileContent(candidate);
+            if (!viewText) continue;
+            const found = findPythonCallableInFile(viewText, mapping.symbolName);
+            if (!found) continue;
+
+            seeds.push({
+              name: mapping.symbolName,
+              file: candidate,
+              code: found.code,
+              lineStart: found.lineStart,
+              lineEnd: found.lineEnd,
+              description_en: 'Django route handler resolved from urls.py.',
+              description_zh: '根据 urls.py 解析得到的 Django 路由处理函数。',
+              drillDown: 1,
+              routePath: toDisplayRoutePath(mapping.route || '/'),
+              bridgeSource: 'python-django-urlconf',
+            });
+            break;
+          } catch {
+            continue;
+          }
+        }
+      }
+    }
+
+    return seeds;
+  };
+
   const detectAndBuildBridgeSeeds = async (
     ctx: BridgeDetectionContext,
     currentFetchId: number
@@ -1188,7 +1416,74 @@ ${fileList}`;
       },
     };
 
-    const bridgeStrategies: CallChainBridgeStrategy[] = [springBootBridge];
+    const pythonWebBridge: CallChainBridgeStrategy = {
+      id: 'python-web-route-bridge',
+      label_en: 'Python web route bridge',
+      label_zh: 'Python Web 路由桥接',
+      canApply: (inputCtx) => {
+        const language = (inputCtx.analysisContext.primaryLanguage_en || '').toLowerCase();
+        const tech = inputCtx.analysisContext.techStack.map((item) => (item || '').toLowerCase());
+        const isPython = language.includes('python');
+        const hasKnownFramework = tech.some((item) =>
+          item.includes('flask') || item.includes('fastapi') || item.includes('django')
+        );
+        const entryLooksPythonWeb =
+          /\bFastAPI\s*\(/.test(inputCtx.entryContent) ||
+          /\bFlask\s*\(/.test(inputCtx.entryContent) ||
+          /\burlpatterns\s*=/.test(inputCtx.entryContent);
+        return isPython && (hasKnownFramework || entryLooksPythonWeb);
+      },
+      collectSeeds: async (inputCtx, fetchId) => {
+        const pyCandidates = inputCtx.allFiles.filter((file) => {
+          const lower = file.toLowerCase();
+          if (!lower.endsWith('.py')) return false;
+          return /(app|main|route|router|api|view|endpoint|controller)/i.test(lower);
+        });
+
+        addLog(
+          {
+            en: `Bridge detection: checking Python route candidates (${pyCandidates.length})...`,
+            zh: `桥接检测：正在检查 Python 路由候选文件（${pyCandidates.length}）...`,
+          },
+          'info',
+          {
+            strategy: 'python-web-route-bridge',
+            candidates: pyCandidates.slice(0, 60),
+          }
+        );
+
+        const seeds: BridgeSeed[] = [];
+        const limit = Math.min(pyCandidates.length, 180);
+        for (const filePath of pyCandidates.slice(0, limit)) {
+          if (fetchId !== fetchIdRef.current) return [];
+          try {
+            const content = await fetchFileText(inputCtx.repo, filePath);
+            if (!content) continue;
+            seeds.push(...parsePythonRouteDecorators(filePath, content.text));
+          } catch (err) {
+            logGithubError('Bridge python route parse', err, filePath);
+          }
+        }
+
+        try {
+          const djangoSeeds = await collectDjangoBridgeSeeds(inputCtx, fetchId);
+          seeds.push(...djangoSeeds);
+        } catch (err) {
+          addLog(
+            {
+              en: `Django URL bridge parsing failed: ${toErrorMessage(err)}`,
+              zh: `Django URL 桥接解析失败：${toErrorMessage(err)}`,
+            },
+            'warning',
+            buildErrorDiagnostics(err, { stage: 'bridge-python-django' })
+          );
+        }
+
+        return seeds;
+      },
+    };
+
+    const bridgeStrategies: CallChainBridgeStrategy[] = [springBootBridge, pythonWebBridge];
     for (const strategy of bridgeStrategies) {
       if (!strategy.canApply(ctx)) continue;
       const seeds = await strategy.collectSeeds(ctx, currentFetchId);
@@ -1214,6 +1509,25 @@ ${fileList}`;
     }
 
     return null;
+  };
+
+  const buildBridgeActivationMessage = (plan: BridgeSeedPlan) => {
+    if (plan.strategyId === 'python-web-route-bridge') {
+      return {
+        en: `Detected Python web framework project. Bridged from entry to route handlers via decorators/urlconf. Identified ${plan.seeds.length} route nodes; this run starts from them.`,
+        zh: `检测到 Python Web 框架项目，已通过路由装饰器/URL 配置将主入口桥接到业务响应函数。共识别 ${plan.seeds.length} 个路由节点，本次分析将以这些节点为起点。`,
+      };
+    }
+    if (plan.strategyId === 'java-springboot-controller') {
+      return {
+        en: `Detected Spring Boot project. Bridged from entry to controller handlers. Identified ${plan.seeds.length} route nodes; this run starts from them.`,
+        zh: `检测到 Spring Boot 项目，已通过 Controller 路由将主入口桥接到业务响应函数。共识别 ${plan.seeds.length} 个路由节点，本次分析将以这些节点为起点。`,
+      };
+    }
+    return {
+      en: `Bridge activated: ${plan.strategyLabel_en}. Seeded ${plan.seeds.length} handlers from entry.`,
+      zh: `桥接模式已启用：${plan.strategyLabel_zh}。已从主入口桥接 ${plan.seeds.length} 个处理函数。`,
+    };
   };
 
   const analyzeSubFunctions = async (entryFilePath: string, currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string, projectSummary: string, allFiles: string[]) => {
@@ -1558,9 +1872,39 @@ For each child function return:
             allResults.push(node);
             setSubFunctions([...allResults]);
 
-            if (!(node.drillDown === 0 || node.drillDown === 1)) continue;
-            if (depth >= maxDepth) continue;
-            if (isLikelySystemOrLibraryFunction(node.name)) continue;
+            if (!(node.drillDown === 0 || node.drillDown === 1)) {
+              addLog(
+                {
+                  en: `Function ${node.name} marked as non-core / no drill-down, stop.`,
+                  zh: `函数 ${node.name} 标记为非核心/无需下钻，停止。`,
+                },
+                'info',
+                { function: node.name, file: node.file, drillDown: node.drillDown, depth }
+              );
+              continue;
+            }
+            if (depth >= maxDepth) {
+              addLog(
+                {
+                  en: `Function ${node.name} reached max drill-down depth (${maxDepth}), stop.`,
+                  zh: `函数 ${node.name} 已达到最大下钻深度（${maxDepth}），停止。`,
+                },
+                'info',
+                { function: node.name, file: node.file, depth, maxDepth }
+              );
+              continue;
+            }
+            if (isLikelySystemOrLibraryFunction(node.name)) {
+              addLog(
+                {
+                  en: `Function ${node.name} marked as system/non-core, stop drill-down.`,
+                  zh: `函数 ${node.name} 标记为系统函数/非核心，停止下钻。`,
+                },
+                'info',
+                { function: node.name, file: node.file, depth, reason: 'system-or-library' }
+              );
+              continue;
+            }
 
             const locationKey = buildFunctionCacheKey(node.file || callerFile, node.name);
             let located: LocatedFunction | null = null;
@@ -1706,14 +2050,19 @@ For each child function return:
 
       if (bridgePlan?.seeds?.length) {
         recursiveStage = 'bridge-seed-drilldown';
-        addLog(
-          {
-            en: `Bridge activated: ${bridgePlan.strategyLabel_en}. Seeded ${bridgePlan.seeds.length} controller handlers from entry.`,
-            zh: `桥接模式已启用：${bridgePlan.strategyLabel_zh}。已从主入口桥接 ${bridgePlan.seeds.length} 个 Controller 处理函数。`,
-          },
-          'success',
-          { strategy: bridgePlan.strategyId, seedCount: bridgePlan.seeds.length }
-        );
+        const bridgeMsg = buildBridgeActivationMessage(bridgePlan);
+        addLog(bridgeMsg, 'success', {
+          strategy: bridgePlan.strategyId,
+          strategyLabel_en: bridgePlan.strategyLabel_en,
+          strategyLabel_zh: bridgePlan.strategyLabel_zh,
+          seedCount: bridgePlan.seeds.length,
+          sampleSeeds: bridgePlan.seeds.slice(0, 12).map((seed) => ({
+            name: seed.name,
+            file: seed.file,
+            routePath: seed.routePath,
+            bridgeSource: seed.bridgeSource,
+          })),
+        });
 
         for (const seed of bridgePlan.seeds) {
           if (currentFetchId !== fetchIdRef.current) return;
@@ -2904,33 +3253,66 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                       t[lang].reanalyzeModules
                     )}
                   </button>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="space-y-2">
                     <button
                       onClick={() => setActiveModuleId(null)}
-                      className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
+                      className={`w-full text-left rounded-xl border px-3 py-2.5 transition-colors ${
                         activeModuleId === null
-                          ? 'bg-slate-900 text-white border-slate-900'
-                          : 'bg-white text-slate-600 border-slate-300 hover:border-slate-400'
+                          ? 'bg-slate-100 border-slate-400'
+                          : 'bg-white border-slate-200 hover:border-slate-300'
                       }`}
                     >
-                      {t[lang].allModules}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-slate-800">{t[lang].allModules}</div>
+                        <div className="text-xs text-slate-500">
+                          {lang === 'en'
+                            ? `${subFunctions.length} function nodes`
+                            : `${subFunctions.length}个函数节点`}
+                        </div>
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {lang === 'en'
+                          ? 'Show all discovered modules and call-chain nodes.'
+                          : '显示全部模块与已识别的调用链节点。'}
+                      </div>
                     </button>
-                    {functionModules.map((module) => (
-                      <button
-                        key={module.id}
-                        onClick={() => setActiveModuleId((prev) => (prev === module.id ? null : module.id))}
-                        className={`px-2.5 py-1 rounded-full text-xs border transition-colors ${
-                          activeModuleId === module.id ? 'text-white border-transparent' : 'text-slate-800'
-                        }`}
-                        style={{
-                          backgroundColor: activeModuleId === module.id ? module.color : `${module.color}26`,
-                          borderColor: module.color,
-                        }}
-                        title={lang === 'en' ? module.description_en : module.description_zh}
-                      >
-                        {(lang === 'en' ? module.name_en : module.name_zh) + ` (${module.functionIds.length})`}
-                      </button>
-                    ))}
+
+                    {functionModules.map((module) => {
+                      const isActive = activeModuleId === module.id;
+                      const displayName = lang === 'en' ? module.name_en : module.name_zh;
+                      const displayDesc =
+                        lang === 'en'
+                          ? module.description_en || 'No description provided.'
+                          : module.description_zh || '暂无模块描述。';
+                      const countLabel =
+                        lang === 'en'
+                          ? `${module.functionIds.length} function nodes`
+                          : `${module.functionIds.length}个函数节点`;
+
+                      return (
+                        <button
+                          key={module.id}
+                          onClick={() => setActiveModuleId((prev) => (prev === module.id ? null : module.id))}
+                          className={`w-full text-left rounded-xl border px-3 py-2.5 transition-colors ${
+                            isActive ? 'bg-slate-100 border-slate-400' : 'bg-white border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center min-w-0">
+                              <span
+                                className="inline-block w-2.5 h-2.5 rounded-full mr-2.5 shrink-0"
+                                style={{ backgroundColor: module.color }}
+                              />
+                              <span className="text-sm font-semibold text-slate-800 truncate">{displayName}</span>
+                            </div>
+                            <div className="text-xs text-slate-500 shrink-0">{countLabel}</div>
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500 leading-relaxed line-clamp-2">
+                            {displayDesc}
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
