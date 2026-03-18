@@ -176,6 +176,7 @@ function AnalyzeContent() {
   const [selectedLine, setSelectedLine] = useState<number | null>(null);
   const [isMarkdownFullscreen, setIsMarkdownFullscreen] = useState(false);
   const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>({ inputTokens: 0, outputTokens: 0, totalCalls: 0 });
+  const [manualDrilldownNodeId, setManualDrilldownNodeId] = useState<string | null>(null);
   const lastFetchedUrl = useRef('');
   const lastSavedHistoryHash = useRef('');
   const fetchIdRef = useRef(0);
@@ -2988,6 +2989,268 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     await handleSelectFile(fileNode, resolvedLine);
   };
 
+  const handleManualPanoramaDrillDown = async (node: { id: string; name: string; file: string; depth?: number; drillDown?: number }) => {
+    if (manualDrilldownNodeId) return;
+    if (!repoInfo) {
+      addLog(
+        { en: 'Cannot continue drill-down: repository info missing.', zh: '无法继续下钻：缺少仓库信息。' },
+        'warning'
+      );
+      return;
+    }
+    if (isAnalyzingSubFunctions) {
+      addLog(
+        { en: 'Recursive drill-down is running. Please wait for it to finish.', zh: '递归下钻正在进行中，请稍后再试。' },
+        'warning'
+      );
+      return;
+    }
+
+    const target = subFunctions.find((item) => item.id === node.id);
+    if (!target) return;
+    if (!(target.drillDown === 0 || target.drillDown === 1)) return;
+    if (subFunctions.some((item) => item.parentId === target.id)) return;
+
+    const ai = createGeminiClient();
+    if (!ai) {
+      addLog(
+        { en: 'Gemini API key is missing. Manual drill-down is unavailable.', zh: '未配置 Gemini API Key，无法手动下钻。' },
+        'error'
+      );
+      return;
+    }
+
+    setManualDrilldownNodeId(target.id);
+    addLog(
+      { en: `Manual drill-down started: ${target.name}`, zh: `开始手动下钻：${target.name}` },
+      'info',
+      { nodeId: target.id, functionName: target.name, file: target.file }
+    );
+
+    try {
+      const allFiles = allFilePaths || [];
+      const maxDepth = getMaxDrillDownDepth();
+      const parentFile = target.file || confirmedEntryFile?.path || '';
+      const functionKey = buildFunctionCacheKey(parentFile, target.name);
+      const drillDownCache = drillDownCacheRef.current;
+      const locationCache = functionLocationCacheRef.current;
+      let children: any[] = [];
+
+      const cachedChildren = drillDownCache.get(functionKey);
+      if (cachedChildren) {
+        children = cachedChildren.map((item) => ({ ...item }));
+        addLog(
+          { en: `Manual drill-down cache hit: ${target.name}`, zh: `手动下钻缓存命中：${target.name}` },
+          'info',
+          { cacheKey: functionKey, childCount: children.length }
+        );
+      } else {
+        const locationKey = buildFunctionCacheKey(parentFile, target.name);
+        let located = locationCache.get(locationKey) || null;
+        if (!located) {
+          located = await locateFunctionDefinition({
+            functionName: target.name,
+            parentFile,
+            allFiles,
+            repo: repoInfo,
+            ai,
+            currentFetchId: fetchIdRef.current,
+          });
+          locationCache.set(locationKey, located);
+        }
+
+        if (!located) {
+          addLog(
+            { en: `Stop manual drill-down: definition not found for ${target.name}`, zh: `停止手动下钻：未找到 ${target.name} 的定义` },
+            'warning',
+            { functionName: target.name, parentFile }
+          );
+          return;
+        }
+
+        setSubFunctions((prev) =>
+          prev.map((item) =>
+            item.id === target.id
+              ? {
+                  ...item,
+                  file: located?.file || item.file,
+                  lineStart: located?.lineStart || item.lineStart,
+                  lineEnd: located?.lineEnd || item.lineEnd,
+                }
+              : item
+          )
+        );
+
+        const endpoint = resolveGeminiEndpoint();
+        const fileList = allFiles.slice(0, 1500).join('\n');
+        const prompt = `Analyze the function below and identify up to 12 key child function calls that are part of the CORE business/control flow.
+Project URL: ${url}
+Project Summary: ${aiAnalysis?.summary_en || ''}
+Caller Function: ${target.name}
+Caller File: ${located.file}
+Depth: ${target.depth ?? 0}/${maxDepth}
+
+Available Files:
+${fileList}
+
+Function Code:
+\`\`\`
+${located.code.substring(0, 12000)}
+\`\`\`
+
+Strict rules:
+1) Return ONLY child calls that are essential to core feature flow, business logic transitions, orchestration, external system interactions, or critical error handling.
+2) EXCLUDE generic utilities and low-value operations: plain data structure ops (map/filter/reduce/forEach/push/pop/sort), string formatting/parsing helpers, trivial getters/setters, logging wrappers, and basic framework lifecycle hooks.
+3) For object-oriented languages, if a call belongs to a class/namespace, name MUST use full qualified form (example: ClassName::FunctionName). Do not return only FunctionName in this case.
+4) Keep max 12 results and prioritize impact on end-to-end behavior.
+5) Return direct child calls only, do not expand grandchildren.
+
+For each child function return:
+1) name
+2) file (likely definition file path)
+3) description_en
+4) description_zh
+5) drillDown (-1=no, 0=unsure, 1=yes)`;
+
+        const aiCallLogId = addAiCallLog(
+          { en: `AI manual drill-down analyzing ${target.name}...`, zh: `AI 正在手动下钻分析 ${target.name}...` },
+          {
+            model: 'gemini-3-flash-preview',
+            baseUrl: endpoint.baseUrl,
+            apiVersion: endpoint.apiVersion,
+            url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
+            functionName: target.name,
+            functionFile: located.file,
+            depth: target.depth ?? 0,
+            maxDepth,
+            prompt,
+          }
+        );
+
+        try {
+          const response = await generateContentWithRetry({
+            ai,
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  subFunctions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        name: { type: Type.STRING },
+                        file: { type: Type.STRING },
+                        description_en: { type: Type.STRING },
+                        description_zh: { type: Type.STRING },
+                        drillDown: { type: Type.INTEGER },
+                      },
+                      required: ['name', 'file', 'description_en', 'description_zh', 'drillDown'],
+                    },
+                  },
+                },
+                required: ['subFunctions'],
+              },
+            },
+            operation: 'manual-drilldown',
+            context: {
+              nodeId: target.id,
+              functionName: target.name,
+              functionFile: located.file,
+              depth: target.depth ?? 0,
+            },
+          });
+          const usage = recordAiUsage(response);
+
+          if (!response.text) {
+            finalizeAiCallLog(aiCallLogId, { response: null, usage, success: false });
+            children = [];
+          } else {
+            const parsed = JSON.parse(response.text);
+            children = Array.isArray(parsed?.subFunctions) ? parsed.subFunctions : [];
+            drillDownCache.set(functionKey, children.map((item: any) => ({ ...item })));
+            finalizeAiCallLog(aiCallLogId, {
+              response: { ...parsed, cacheStored: true, cacheKey: functionKey },
+              usage,
+              success: true,
+            });
+          }
+        } catch (err: any) {
+          finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
+          throw err;
+        }
+      }
+
+      if (!children.length) {
+        addLog(
+          { en: `Manual drill-down finished: no new child nodes for ${target.name}.`, zh: `手动下钻完成：${target.name} 无新增子节点。` },
+          'info'
+        );
+        return;
+      }
+
+      let addedCount = 0;
+      setSubFunctions((prev) => {
+        const next = [...prev];
+        const existing = new Set(
+          prev.map((item) => `${item.parentId}::${item.name.trim().toLowerCase()}::${(item.file || '').trim().toLowerCase()}`)
+        );
+
+        for (const child of children) {
+          const childName = (child?.name || '').trim();
+          if (!childName) continue;
+          const childFile = (child?.file || '').trim();
+          const key = `${target.id}::${childName.toLowerCase()}::${childFile.toLowerCase()}`;
+          if (existing.has(key)) continue;
+          existing.add(key);
+          addedCount += 1;
+
+          next.push({
+            id: `n-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+            parentId: target.id,
+            depth: (target.depth ?? 0) + 1,
+            name: childName,
+            file: childFile,
+            description_en: child?.description_en || '',
+            description_zh: child?.description_zh || '',
+            drillDown: Number.isInteger(child?.drillDown) ? child.drillDown : 0,
+            routePath: typeof child?.routePath === 'string' ? child.routePath : undefined,
+          });
+        }
+
+        return next;
+      });
+
+      addLog(
+        {
+          en: `Manual drill-down complete for ${target.name}: added ${addedCount} child node(s).`,
+          zh: `${target.name} 手动下钻完成：新增 ${addedCount} 个子节点。`,
+        },
+        'success',
+        { nodeId: target.id, addedCount }
+      );
+    } catch (err: any) {
+      addLog(
+        {
+          en: `Manual drill-down failed for ${target.name}: ${err?.message || String(err)}`,
+          zh: `${target.name} 手动下钻失败：${err?.message || String(err)}`,
+        },
+        'warning',
+        buildErrorDiagnostics(err, {
+          stage: 'manual-drilldown',
+          nodeId: target.id,
+          functionName: target.name,
+          functionFile: target.file,
+        })
+      );
+    } finally {
+      setManualDrilldownNodeId(null);
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col bg-white">
       {/* Header */}
@@ -3521,6 +3784,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                         lang={lang}
                         activeModuleId={activeModuleId}
                         onOpenSource={handleOpenPanoramaNodeSource}
+                        onManualDrillDown={handleManualPanoramaDrillDown}
+                        manualDrilldownNodeId={manualDrilldownNodeId}
                       />
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4 p-8 text-center">
