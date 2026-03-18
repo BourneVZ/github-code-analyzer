@@ -56,6 +56,11 @@ const CustomNode = ({ data }: any) => {
       <div className="p-3">
         <div className="font-bold text-sm text-slate-900 mb-1 truncate">{data.name}</div>
         <div className="text-xs text-slate-600 line-clamp-3">{data.description}</div>
+        {data.routePath ? (
+          <div className="text-[11px] text-indigo-700 mt-1 truncate" title={data.routePath}>
+            {data.routeLabel || 'URL'}: {data.routePath}
+          </div>
+        ) : null}
       </div>
       <Handle type="source" position={Position.Right} className="w-2 h-2 !bg-slate-800" />
     </div>
@@ -73,6 +78,7 @@ type PanoramaNode = {
   file: string;
   lineStart?: number;
   lineEnd?: number;
+  routePath?: string;
   description_en?: string;
   description_zh?: string;
   drillDown?: number;
@@ -210,6 +216,8 @@ export function Panorama({
           file: sf.file,
           lineStart: sf.lineStart,
           lineEnd: sf.lineEnd,
+          routePath: sf.routePath,
+          routeLabel: lang === 'en' ? 'URL' : '路由',
           description: lang === 'en' ? sf.description_en : sf.description_zh,
           drillDown: sf.drillDown,
           headerColor: (sf as any).moduleColor || '#f8fafc',

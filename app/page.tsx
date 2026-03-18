@@ -2,8 +2,8 @@
 
 import { useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
-import { Github, Search, AlertCircle, Languages, History, Clock3 } from 'lucide-react';
-import { getAnalysisHistory, getAnalysisHistoryServerSnapshot, subscribeAnalysisHistory, type AnalysisHistoryRecord } from '@/lib/analysisHistory';
+import { Github, Search, AlertCircle, Languages, History, Clock3, Trash2 } from 'lucide-react';
+import { getAnalysisHistory, getAnalysisHistoryServerSnapshot, removeAnalysisHistoryRecord, subscribeAnalysisHistory, type AnalysisHistoryRecord } from '@/lib/analysisHistory';
 
 export default function Home() {
   const [url, setUrl] = useState('');
@@ -82,6 +82,15 @@ export default function Home() {
     );
   };
 
+  const deleteHistoryRecord = (e: React.MouseEvent, record: AnalysisHistoryRecord) => {
+    e.stopPropagation();
+    const confirmed = window.confirm(
+      lang === 'en' ? 'Delete this history record?' : '确定删除这条历史记录吗？'
+    );
+    if (!confirmed) return;
+    removeAnalysisHistoryRecord(record.id);
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 relative">
       <button
@@ -151,11 +160,20 @@ export default function Home() {
                   'N/A';
 
                 return (
-                  <button
+                  <div
                     key={record.id}
                     onClick={() => openHistoryRecord(record)}
-                    className="w-full text-left bg-white border border-slate-200 rounded-xl p-4 hover:border-indigo-300 hover:shadow-sm transition-all"
+                    className="relative w-full text-left bg-white border border-slate-200 rounded-xl p-4 hover:border-indigo-300 hover:shadow-sm transition-all cursor-pointer"
                   >
+                    <button
+                      type="button"
+                      onClick={(e) => deleteHistoryRecord(e, record)}
+                      title={lang === 'en' ? 'Delete' : '删除'}
+                      aria-label={lang === 'en' ? 'Delete history' : '删除历史记录'}
+                      className="absolute top-3 right-3 p-1.5 rounded-md text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                     <div className="font-semibold text-slate-900 truncate mb-1">{record.projectName}</div>
                     <div className="text-xs text-slate-500 break-all mb-3">
                       {t[lang].projectUrl}: {record.projectUrl}
@@ -168,7 +186,7 @@ export default function Home() {
                       </span>
                     </div>
                     <div className="mt-2 text-xs text-indigo-600 font-medium">{t[lang].openHistory}</div>
-                  </button>
+                  </div>
                 );
               })}
             </div>

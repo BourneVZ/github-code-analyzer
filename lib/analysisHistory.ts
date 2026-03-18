@@ -26,6 +26,8 @@ export type StoredSubFunctionNode = {
   description_en: string;
   description_zh: string;
   drillDown: number;
+  routePath?: string;
+  bridgeSource?: string;
   moduleId?: string;
   moduleName_en?: string;
   moduleName_zh?: string;
@@ -148,6 +150,17 @@ export const saveAnalysisHistoryRecord = (record: AnalysisHistoryRecord) => {
   const next = [record, ...filtered]
     .sort((a, b) => +new Date(b.savedAt) - +new Date(a.savedAt))
     .slice(0, MAX_HISTORY_RECORDS);
+  const raw = JSON.stringify(next);
+  window.localStorage.setItem(HISTORY_STORAGE_KEY, raw);
+  cachedRawHistory = raw;
+  cachedHistory = next;
+  historyListeners.forEach((listener) => listener());
+};
+
+export const removeAnalysisHistoryRecord = (id: string) => {
+  if (!isBrowser()) return;
+  const list = getAnalysisHistory();
+  const next = list.filter((item) => item.id !== id);
   const raw = JSON.stringify(next);
   window.localStorage.setItem(HISTORY_STORAGE_KEY, raw);
   cachedRawHistory = raw;

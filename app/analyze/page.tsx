@@ -47,6 +47,8 @@ type SubFunctionNode = {
   description_en: string;
   description_zh: string;
   drillDown: number;
+  routePath?: string;
+  bridgeSource?: string;
   moduleId?: string;
   moduleName_en?: string;
   moduleName_zh?: string;
@@ -80,6 +82,46 @@ type AiUsageStats = {
   inputTokens: number;
   outputTokens: number;
   totalCalls: number;
+};
+
+type BridgeSeed = {
+  name: string;
+  file: string;
+  code: string;
+  lineStart: number;
+  lineEnd: number;
+  description_en: string;
+  description_zh: string;
+  drillDown: number;
+  routePath?: string;
+  bridgeSource: string;
+};
+
+type BridgeSeedPlan = {
+  strategyId: string;
+  strategyLabel_en: string;
+  strategyLabel_zh: string;
+  seeds: BridgeSeed[];
+};
+
+type BridgeDetectionContext = {
+  entryFilePath: string;
+  entryContent: string;
+  analysisContext: {
+    summary_en: string;
+    primaryLanguage_en: string;
+    techStack: string[];
+  };
+  allFiles: string[];
+  repo: RepoRef;
+};
+
+type CallChainBridgeStrategy = {
+  id: string;
+  label_en: string;
+  label_zh: string;
+  canApply: (ctx: BridgeDetectionContext) => boolean;
+  collectSeeds: (ctx: BridgeDetectionContext, currentFetchId: number) => Promise<BridgeSeed[]>;
 };
 
 function AnalyzeContent() {
@@ -309,6 +351,96 @@ function AnalyzeContent() {
     return usage;
   };
 
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const isTransientAiNetworkError = (err: unknown) => {
+    const message = toErrorMessage(err).toLowerCase();
+    if (message.includes('failed to fetch')) return true;
+    if (message.includes('networkerror')) return true;
+    if (message.includes('fetch failed')) return true;
+    if (message.includes('timeout')) return true;
+    return false;
+  };
+
+  const getGeminiRetryPolicy = () => {
+    const maxRetriesRaw =
+      process.env.NEXT_PUBLIC_GEMINI_RETRY_MAX_RETRIES ||
+      process.env.GEMINI_RETRY_MAX_RETRIES ||
+      '2';
+    const baseDelayRaw =
+      process.env.NEXT_PUBLIC_GEMINI_RETRY_BASE_DELAY_MS ||
+      process.env.GEMINI_RETRY_BASE_DELAY_MS ||
+      '600';
+
+    const maxRetries = Math.min(Math.max(Number.parseInt(maxRetriesRaw, 10) || 2, 0), 6);
+    const baseDelayMs = Math.min(Math.max(Number.parseInt(baseDelayRaw, 10) || 600, 150), 10_000);
+    return { maxRetries, baseDelayMs };
+  };
+
+  const generateContentWithRetry = async ({
+    ai,
+    model,
+    contents,
+    config,
+    operation,
+    context,
+  }: {
+    ai: GoogleGenAI;
+    model: string;
+    contents: string;
+    config?: any;
+    operation: string;
+    context?: Record<string, any>;
+  }) => {
+    const { maxRetries, baseDelayMs } = getGeminiRetryPolicy();
+    let attempt = 0;
+    let lastErr: unknown = null;
+
+    while (attempt <= maxRetries) {
+      try {
+        return await ai.models.generateContent({
+          model,
+          contents,
+          ...(config ? { config } : {}),
+        });
+      } catch (err) {
+        lastErr = err;
+        const transient = isTransientAiNetworkError(err);
+        if (!transient || attempt >= maxRetries) {
+          if (transient) {
+            const base = toErrorMessage(err);
+            throw new Error(
+              `Gemini network request failed after ${attempt + 1} attempt(s): ${base}. ` +
+              `Check GEMINI_BASE_URL/proxy/network, or increase GEMINI_RETRY_MAX_RETRIES.`
+            );
+          }
+          throw err;
+        }
+
+        const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+        addLog(
+          {
+            en: `AI network jitter detected (${operation}), retry ${attempt + 1}/${maxRetries} in ${delay}ms...`,
+            zh: `检测到 AI 网络抖动（${operation}），将在 ${delay}ms 后重试 ${attempt + 1}/${maxRetries}...`,
+          },
+          'warning',
+          buildErrorDiagnostics(err, {
+            stage: 'ai-retry',
+            operation,
+            attempt: attempt + 1,
+            maxRetries,
+            delay,
+            ...(context || {}),
+          })
+        );
+        await sleep(delay);
+        attempt += 1;
+      }
+    }
+
+    throw lastErr instanceof Error ? lastErr : new Error('Unknown AI request error');
+  };
+
   const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
 
   const getGithubTokenMeta = () => {
@@ -472,6 +604,25 @@ function AnalyzeContent() {
     );
   };
 
+  const buildErrorDiagnostics = (err: unknown, context?: Record<string, any>) => {
+    const base = {
+      message: toErrorMessage(err),
+      name: err instanceof Error ? err.name : typeof err,
+      stack: err instanceof Error ? err.stack : undefined,
+      context: context || {},
+      timestamp: new Date().toISOString(),
+    } as Record<string, any>;
+
+    if (err instanceof GithubRequestError) {
+      base.github = err.details;
+      base.errorType = 'github_request_error';
+    } else {
+      base.errorType = 'generic_error';
+    }
+
+    return base;
+  };
+
   const getMaxDrillDownDepth = () => {
     const raw =
       process.env.NEXT_PUBLIC_GEMINI_DRILLDOWN_MAX_DEPTH ||
@@ -617,10 +768,16 @@ function AnalyzeContent() {
       'setstate',
       'useeffect',
       'usestate',
+      'haserrors',
     ]);
     if (deny.has(n)) return true;
     if (/^(get|set|is)[A-Z_]/.test(leafName)) return false;
     return n.length <= 2;
+  };
+
+  const isGithubNotFoundError = (err: unknown) => {
+    if (!(err instanceof GithubRequestError)) return false;
+    return Number(err.details?.status) === 404;
   };
 
   const stripFunctionCallDecorators = (input: string) => {
@@ -787,11 +944,17 @@ function AnalyzeContent() {
 
     // Stage 1: same file as parent caller
     if (parentFile) {
-      const parentFileContent = await fetchFileText(repo, parentFile);
-      if (parentFileContent) {
-        const inParent = findFunctionInFile(parentFileContent.text, functionName);
-        if (inParent) {
-          return { ...inParent, file: parentFile };
+      try {
+        const parentFileContent = await fetchFileText(repo, parentFile);
+        if (parentFileContent) {
+          const inParent = findFunctionInFile(parentFileContent.text, functionName);
+          if (inParent) {
+            return { ...inParent, file: parentFile };
+          }
+        }
+      } catch (err) {
+        if (!isGithubNotFoundError(err)) {
+          // Continue to next stages on transient fetch/network failures.
         }
       }
     }
@@ -805,7 +968,8 @@ Files:
 ${fileList}`;
 
     try {
-      const guessResp = await ai.models.generateContent({
+      const guessResp = await generateContentWithRetry({
+        ai,
         model: "gemini-3-flash-preview",
         contents: guessPrompt,
         config: {
@@ -821,6 +985,8 @@ ${fileList}`;
             required: ["candidateFiles"],
           },
         },
+        operation: 'locate-guess-files',
+        context: { functionName, parentFile },
       });
       recordAiUsage(guessResp);
 
@@ -828,10 +994,16 @@ ${fileList}`;
         const guessed = JSON.parse(guessResp.text)?.candidateFiles || [];
         for (const file of guessed) {
           if (currentFetchId !== fetchIdRef.current) return null;
-          const content = await fetchFileText(repo, file);
-          if (!content) continue;
-          const found = findFunctionInFile(content.text, functionName);
-          if (found) return { ...found, file };
+          try {
+            const content = await fetchFileText(repo, file);
+            if (!content) continue;
+            const found = findFunctionInFile(content.text, functionName);
+            if (found) return { ...found, file };
+          } catch (err) {
+            if (!isGithubNotFoundError(err)) {
+              continue;
+            }
+          }
         }
       }
     } catch {
@@ -841,10 +1013,204 @@ ${fileList}`;
     // Stage 3: regex search across project files
     for (const file of allFiles) {
       if (currentFetchId !== fetchIdRef.current) return null;
-      const content = await fetchFileText(repo, file);
-      if (!content) continue;
-      const found = findFunctionInFile(content.text, functionName);
-      if (found) return { ...found, file };
+      try {
+        const content = await fetchFileText(repo, file);
+        if (!content) continue;
+        const found = findFunctionInFile(content.text, functionName);
+        if (found) return { ...found, file };
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  };
+
+  const normalizeUrlPath = (value: string) => {
+    const raw = (value || '').trim();
+    if (!raw) return '';
+    const withSlash = raw.startsWith('/') ? raw : `/${raw}`;
+    return withSlash.replace(/\/{2,}/g, '/').replace(/\/$/, '') || '/';
+  };
+
+  const joinUrlPath = (base: string, child: string) => {
+    const left = normalizeUrlPath(base);
+    const right = normalizeUrlPath(child);
+    if (!left && !right) return '/';
+    if (!left) return right;
+    if (!right || right === '/') return left;
+    return `${left === '/' ? '' : left}${right}`;
+  };
+
+  const extractQuotedStrings = (input: string) => {
+    const results: string[] = [];
+    const re = /"([^"]+)"/g;
+    let match: RegExpExecArray | null = null;
+    while ((match = re.exec(input)) !== null) {
+      const value = (match[1] || '').trim();
+      if (value) results.push(value);
+    }
+    return Array.from(new Set(results));
+  };
+
+  const parseSpringMappingPaths = (annotationArgs: string) => {
+    const args = (annotationArgs || '').trim();
+    if (!args) return ['/'];
+
+    const keyedPathMatch = args.match(/\b(?:path|value)\s*=\s*(\{[\s\S]*?\}|"[^"]*")/);
+    const primaryScope = keyedPathMatch ? keyedPathMatch[1] : args;
+    const paths = extractQuotedStrings(primaryScope);
+    if (paths.length > 0) {
+      return paths.map((item) => normalizeUrlPath(item) || '/');
+    }
+    return ['/'];
+  };
+
+  const parseSpringRequestMethod = (annotationType: string, annotationArgs: string) => {
+    const normalizedType = (annotationType || '').trim();
+    if (/^GetMapping$/i.test(normalizedType)) return 'GET';
+    if (/^PostMapping$/i.test(normalizedType)) return 'POST';
+    if (/^PutMapping$/i.test(normalizedType)) return 'PUT';
+    if (/^DeleteMapping$/i.test(normalizedType)) return 'DELETE';
+    if (/^PatchMapping$/i.test(normalizedType)) return 'PATCH';
+
+    const methodMatch = annotationArgs.match(/\bmethod\s*=\s*(?:\{)?\s*RequestMethod\.(\w+)/i);
+    if (methodMatch?.[1]) return methodMatch[1].toUpperCase();
+    return '';
+  };
+
+  const parseSpringControllerSeeds = (filePath: string, fileText: string): BridgeSeed[] => {
+    if (!/@(?:RestController|Controller)\b/.test(fileText)) return [];
+
+    const classMatch = /(?:public\s+)?(?:abstract\s+)?class\s+\w+/m.exec(fileText);
+    const classHeader = classMatch ? fileText.slice(0, classMatch.index) : fileText.slice(0, 1500);
+    const classRequestMappings = Array.from(classHeader.matchAll(/@RequestMapping\s*\(([\s\S]*?)\)/g));
+    const classPaths = classRequestMappings.length
+      ? parseSpringMappingPaths(classRequestMappings[classRequestMappings.length - 1][1] || '')
+      : ['/'];
+
+    const methodRe =
+      /@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*(?:\(([\s\S]*?)\))?[\s\r\n]*(?:@\w+(?:\([^)]*\))?[\s\r\n]*)*(?:public|protected|private)\s+(?:static\s+)?[\w<>\[\],?.\s]+\s+([A-Za-z_]\w*)\s*\(/g;
+
+    const seeds: BridgeSeed[] = [];
+    let match: RegExpExecArray | null = null;
+
+    while ((match = methodRe.exec(fileText)) !== null) {
+      const annotationType = match[1] || '';
+      const annotationArgs = match[2] || '';
+      const functionName = match[3] || '';
+      if (!functionName) continue;
+
+      const snippet = extractFunctionSnippet(fileText, match.index);
+      const methodPaths = parseSpringMappingPaths(annotationArgs);
+      const method = parseSpringRequestMethod(annotationType, annotationArgs);
+
+      const routeList = new Set<string>();
+      for (const basePath of classPaths) {
+        for (const methodPath of methodPaths) {
+          const routePath = joinUrlPath(basePath, methodPath);
+          const display = method ? `${method} ${routePath}` : routePath;
+          routeList.add(display);
+        }
+      }
+
+      seeds.push({
+        name: functionName,
+        file: filePath,
+        code: snippet.code,
+        lineStart: snippet.lineStart,
+        lineEnd: snippet.lineEnd,
+        description_en: 'Spring Boot controller endpoint handler.',
+        description_zh: 'Spring Boot Controller 接口处理函数。',
+        drillDown: 1,
+        routePath: Array.from(routeList).join(' | '),
+        bridgeSource: 'java-springboot-controller',
+      });
+    }
+
+    return seeds;
+  };
+
+  const detectAndBuildBridgeSeeds = async (
+    ctx: BridgeDetectionContext,
+    currentFetchId: number
+  ): Promise<BridgeSeedPlan | null> => {
+    if (currentFetchId !== fetchIdRef.current) return null;
+
+    const springBootBridge: CallChainBridgeStrategy = {
+      id: 'java-springboot-controller',
+      label_en: 'Spring Boot controller bridge',
+      label_zh: 'Spring Boot Controller 桥接',
+      canApply: (inputCtx) => {
+        const language = (inputCtx.analysisContext.primaryLanguage_en || '').toLowerCase();
+        const tech = inputCtx.analysisContext.techStack.map((item) => (item || '').toLowerCase());
+        const isJava = language.includes('java');
+        const mentionsSpring = tech.some((item) => item.includes('spring'));
+        const looksLikeSpringBootEntry = /SpringApplication\.run\s*\(/.test(inputCtx.entryContent);
+        return isJava && (mentionsSpring || looksLikeSpringBootEntry);
+      },
+      collectSeeds: async (inputCtx, fetchId) => {
+        const controllerCandidates = inputCtx.allFiles.filter((file) => {
+          const lower = file.toLowerCase();
+          if (!lower.endsWith('.java')) return false;
+          return lower.includes('/controller/') || lower.includes('/controllers/') || lower.endsWith('controller.java');
+        });
+
+        if (!controllerCandidates.length) return [];
+
+        addLog(
+          {
+            en: `Bridge detection: checking ${controllerCandidates.length} Spring controller candidates...`,
+            zh: `桥接检测：正在检查 ${controllerCandidates.length} 个 Spring Controller 候选文件...`,
+          },
+          'info',
+          {
+            strategy: 'java-springboot-controller',
+            candidates: controllerCandidates.slice(0, 50),
+          }
+        );
+
+        const seeds: BridgeSeed[] = [];
+        const limit = Math.min(controllerCandidates.length, 120);
+        for (const filePath of controllerCandidates.slice(0, limit)) {
+          if (fetchId !== fetchIdRef.current) return [];
+          try {
+            const content = await fetchFileText(inputCtx.repo, filePath);
+            if (!content) continue;
+            const parsed = parseSpringControllerSeeds(filePath, content.text);
+            seeds.push(...parsed);
+          } catch (err) {
+            logGithubError('Bridge controller parse', err, filePath);
+          }
+        }
+
+        return seeds;
+      },
+    };
+
+    const bridgeStrategies: CallChainBridgeStrategy[] = [springBootBridge];
+    for (const strategy of bridgeStrategies) {
+      if (!strategy.canApply(ctx)) continue;
+      const seeds = await strategy.collectSeeds(ctx, currentFetchId);
+      if (currentFetchId !== fetchIdRef.current) return null;
+
+      const deduped = Array.from(
+        new Map(
+          seeds.map((item) => [
+            `${item.file}::${item.name}::${item.lineStart}`,
+            item,
+          ])
+        ).values()
+      );
+
+      if (!deduped.length) continue;
+
+      return {
+        strategyId: strategy.id,
+        strategyLabel_en: strategy.label_en,
+        strategyLabel_zh: strategy.label_zh,
+        seeds: deduped.slice(0, 80),
+      };
     }
 
     return null;
@@ -908,7 +1274,8 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
         aiRequest
       );
 
-      const response = await ai.models.generateContent({
+      const response = await generateContentWithRetry({
+        ai,
         model: "gemini-3-flash-preview",
         contents: prompt,
         config: {
@@ -933,7 +1300,9 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
             },
             required: ["subFunctions"]
           }
-        }
+        },
+        operation: 'legacy-entry-subfunctions',
+        context: { entryFilePath, currentFetchId },
       });
       const usage = recordAiUsage(response);
 
@@ -951,6 +1320,7 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
           description_en: item?.description_en || '',
           description_zh: item?.description_zh || '',
           drillDown: Number.isInteger(item?.drillDown) ? item.drillDown : 0,
+          routePath: typeof item?.routePath === 'string' ? item.routePath : undefined,
         }));
         setSubFunctions(nodes);
         addLog(
@@ -990,6 +1360,7 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
     setIsAnalyzingSubFunctions(true);
     setWorkflow('working', 'AI is analyzing call chain...', 'AI 正在分析调用链...');
     setSubFunctions([]);
+    let recursiveStage = 'init';
     addLog(
       { en: 'Starting recursive sub-function analysis...', zh: '开始递归分析子函数...' },
       'info'
@@ -1098,7 +1469,8 @@ For each child function return:
             );
 
             try {
-              const response = await ai.models.generateContent({
+              const response = await generateContentWithRetry({
+                ai,
                 model: 'gemini-3-flash-preview',
                 contents: prompt,
                 config: {
@@ -1124,6 +1496,13 @@ For each child function return:
                     required: ['subFunctions'],
                   },
                 },
+                operation: 'recursive-drilldown',
+                context: {
+                  functionName,
+                  functionFile,
+                  depth,
+                  parentId,
+                },
               });
               const usage = recordAiUsage(response);
 
@@ -1141,7 +1520,21 @@ For each child function return:
               });
             } catch (err: any) {
               finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
-              throw err;
+              addLog(
+                {
+                  en: `Skip drill-down for ${functionName}: AI request failed (${err?.message || String(err)}).`,
+                  zh: `跳过 ${functionName} 的下钻：AI 请求失败（${err?.message || String(err)}）。`,
+                },
+                'warning',
+                buildErrorDiagnostics(err, {
+                  stage: 'drilldown-ai',
+                  functionName,
+                  functionFile,
+                  depth,
+                  parentId,
+                })
+              );
+              children = [];
             }
           }
 
@@ -1160,6 +1553,7 @@ For each child function return:
               description_en: child?.description_en || '',
               description_zh: child?.description_zh || '',
               drillDown: Number.isInteger(child?.drillDown) ? child.drillDown : 0,
+              routePath: typeof child?.routePath === 'string' ? child.routePath : undefined,
             };
             allResults.push(node);
             setSubFunctions([...allResults]);
@@ -1183,15 +1577,35 @@ For each child function return:
                 'info',
                 { cacheKey: locationKey }
               );
-              located = await locateFunctionDefinition({
-                functionName: node.name,
-                parentFile: node.file || callerFile,
-                allFiles,
-                repo,
-                ai,
-                currentFetchId,
-              });
-              locationCache.set(locationKey, located);
+              try {
+                located = await locateFunctionDefinition({
+                  functionName: node.name,
+                  parentFile: callerFile,
+                  allFiles,
+                  repo,
+                  ai,
+                  currentFetchId,
+                });
+                locationCache.set(locationKey, located);
+              } catch (err: any) {
+                locationCache.set(locationKey, null);
+                addLog(
+                  {
+                    en: `Skip drill-down for ${node.name}: locate definition failed (${err?.message || String(err)}).`,
+                    zh: `跳过 ${node.name} 的下钻：定位定义失败（${err?.message || String(err)}）。`,
+                  },
+                  'warning',
+                  buildErrorDiagnostics(err, {
+                    stage: 'locate-definition',
+                    functionName: node.name,
+                    hintedFile: node.file,
+                    callerFile,
+                    depth,
+                    cacheKey: locationKey,
+                  })
+                );
+                continue;
+              }
             }
 
             if (!located) {
@@ -1208,20 +1622,53 @@ For each child function return:
             node.lineEnd = located.lineEnd;
             setSubFunctions([...allResults]);
 
-            await analyzeFunctionCode({
-              functionName: node.name,
-              callerFile: located.file,
-              functionCode: located.code,
-              functionFile: located.file,
-              depth: depth + 1,
-              parentId: nodeId,
-            });
+            try {
+              await analyzeFunctionCode({
+                functionName: node.name,
+                callerFile: located.file,
+                functionCode: located.code,
+                functionFile: located.file,
+                depth: depth + 1,
+                parentId: nodeId,
+              });
+            } catch (err: any) {
+              addLog(
+                {
+                  en: `Skip nested drill-down for ${node.name}: ${err?.message || String(err)}`,
+                  zh: `跳过 ${node.name} 的嵌套下钻：${err?.message || String(err)}`,
+                },
+                'warning',
+                buildErrorDiagnostics(err, {
+                  stage: 'nested-drilldown',
+                  functionName: node.name,
+                  file: located.file,
+                  depth: depth + 1,
+                })
+              );
+            }
           }
+        } catch (err: any) {
+          addLog(
+            {
+              en: `Skip function ${functionName}: unexpected drill-down error (${err?.message || String(err)}).`,
+              zh: `跳过函数 ${functionName}：下钻出现未预期错误（${err?.message || String(err)}）。`,
+            },
+            'warning',
+            buildErrorDiagnostics(err, {
+              stage: 'drilldown-function',
+              functionName,
+              callerFile,
+              functionFile,
+              depth,
+              parentId,
+            })
+          );
         } finally {
           activeStack.delete(functionKey);
         }
       };
 
+      recursiveStage = 'entry-fetch';
       const entryContent = await fetchFileText(repo, entryFilePath);
       if (!entryContent) {
         addLog(
@@ -1230,15 +1677,112 @@ For each child function return:
         );
         return;
       }
+      recursiveStage = 'bridge-detection';
+      let bridgePlan: BridgeSeedPlan | null = null;
+      try {
+        bridgePlan = await detectAndBuildBridgeSeeds(
+          {
+            entryFilePath,
+            entryContent: entryContent.text,
+            analysisContext,
+            allFiles,
+            repo,
+          },
+          currentFetchId
+        );
+      } catch (err: any) {
+        addLog(
+          {
+            en: `Bridge detection failed, fallback to default entry tracing: ${err?.message || String(err)}`,
+            zh: `桥接检测失败，回退到默认入口追踪：${err?.message || String(err)}`,
+          },
+          'warning',
+          buildErrorDiagnostics(err, {
+            stage: 'bridge-detection',
+            entryFilePath,
+          })
+        );
+      }
 
-      await analyzeFunctionCode({
-        functionName: 'ENTRY',
-        callerFile: entryFilePath,
-        functionCode: entryContent.text,
-        functionFile: entryFilePath,
-        depth: 0,
-        parentId: 'root',
-      });
+      if (bridgePlan?.seeds?.length) {
+        recursiveStage = 'bridge-seed-drilldown';
+        addLog(
+          {
+            en: `Bridge activated: ${bridgePlan.strategyLabel_en}. Seeded ${bridgePlan.seeds.length} controller handlers from entry.`,
+            zh: `桥接模式已启用：${bridgePlan.strategyLabel_zh}。已从主入口桥接 ${bridgePlan.seeds.length} 个 Controller 处理函数。`,
+          },
+          'success',
+          { strategy: bridgePlan.strategyId, seedCount: bridgePlan.seeds.length }
+        );
+
+        for (const seed of bridgePlan.seeds) {
+          if (currentFetchId !== fetchIdRef.current) return;
+          const nodeId = `n-${idCounter++}`;
+          allResults.push({
+            id: nodeId,
+            parentId: 'root',
+            depth: 0,
+            name: seed.name,
+            file: seed.file,
+            lineStart: seed.lineStart,
+            lineEnd: seed.lineEnd,
+            description_en: seed.description_en,
+            description_zh: seed.description_zh,
+            drillDown: seed.drillDown,
+            routePath: seed.routePath,
+            bridgeSource: seed.bridgeSource,
+          });
+          setSubFunctions([...allResults]);
+
+          try {
+            await analyzeFunctionCode({
+              functionName: seed.name,
+              callerFile: seed.file,
+              functionCode: seed.code,
+              functionFile: seed.file,
+              depth: 1,
+              parentId: nodeId,
+            });
+          } catch (err: any) {
+            addLog(
+              {
+                en: `Skip seed ${seed.name}: ${err?.message || String(err)}`,
+                zh: `跳过桥接种子 ${seed.name}：${err?.message || String(err)}`,
+              },
+              'warning',
+              buildErrorDiagnostics(err, {
+                stage: 'bridge-seed-drilldown',
+                seedName: seed.name,
+                seedFile: seed.file,
+              })
+            );
+          }
+        }
+      } else {
+        recursiveStage = 'entry-drilldown';
+        try {
+          await analyzeFunctionCode({
+            functionName: 'ENTRY',
+            callerFile: entryFilePath,
+            functionCode: entryContent.text,
+            functionFile: entryFilePath,
+            depth: 0,
+            parentId: 'root',
+          });
+        } catch (err: any) {
+          addLog(
+            {
+              en: `Entry drill-down failed but workflow will continue: ${err?.message || String(err)}`,
+              zh: `入口下钻失败，但流程将继续：${err?.message || String(err)}`,
+            },
+            'warning',
+            buildErrorDiagnostics(err, {
+              stage: 'entry-drilldown',
+              entryFilePath,
+            })
+          );
+        }
+      }
 
       if (currentFetchId !== fetchIdRef.current) return;
       setSubFunctions(allResults);
@@ -1248,12 +1792,32 @@ For each child function return:
         { maxDepth, totalNodes: allResults.length }
       );
 
-      await analyzeFunctionModules(allResults, currentFetchId, targetUrl, analysisContext);
+      recursiveStage = 'module-grouping';
+      try {
+        await analyzeFunctionModules(allResults, currentFetchId, targetUrl, analysisContext);
+      } catch (err: any) {
+        addLog(
+          {
+            en: `Module grouping failed but call-chain results were kept: ${err?.message || String(err)}`,
+            zh: `模块划分失败，但调用链结果已保留：${err?.message || String(err)}`,
+          },
+          'warning',
+          buildErrorDiagnostics(err, {
+            stage: 'module-grouping',
+            nodeCount: allResults.length,
+          })
+        );
+      }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
+      const msg = err?.message || String(err);
       addLog(
-        { en: `Error in recursive sub-function analysis: ${err.message}`, zh: `递归子函数分析出错: ${err.message}` },
-        'error'
+        {
+          en: `Error in recursive sub-function analysis [stage=${recursiveStage}]: ${msg}`,
+          zh: `递归子函数分析出错 [阶段=${recursiveStage}]：${msg}`,
+        },
+        'error',
+        buildErrorDiagnostics(err, { stage: 'recursive-top', recursiveStage })
       );
     } finally {
       if (currentFetchId === fetchIdRef.current) {
@@ -1323,7 +1887,8 @@ ${JSON.stringify(compactNodes)}`;
         }
       );
 
-      const response = await ai.models.generateContent({
+      const response = await generateContentWithRetry({
+        ai,
         model: 'gemini-3.1-pro-preview',
         contents: prompt,
         config: {
@@ -1350,6 +1915,8 @@ ${JSON.stringify(compactNodes)}`;
             required: ['modules'],
           },
         },
+        operation: 'module-grouping',
+        context: { nodeCount: compactNodes.length, targetUrl },
       });
       const usage = recordAiUsage(response);
 
@@ -1409,7 +1976,15 @@ ${JSON.stringify(compactNodes)}`;
         finalizeAiCallLog(aiCallLogId, { error: err?.message || String(err), success: false });
       }
       setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
-      addLog({ en: `Function module grouping failed: ${err.message}`, zh: `函数模块划分失败: ${err.message}` }, 'error');
+      addLog(
+        { en: `Function module grouping failed: ${err.message}`, zh: `函数模块划分失败: ${err.message}` },
+        'error',
+        buildErrorDiagnostics(err, {
+          stage: 'module-grouping',
+          nodeCount: nodes.length,
+          targetUrl,
+        })
+      );
     } finally {
       if (currentFetchId === fetchIdRef.current) {
         setIsAnalyzingModules(false);
@@ -1501,7 +2076,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             }
           );
 
-          const response = await ai.models.generateContent({
+          const response = await generateContentWithRetry({
+            ai,
             model: "gemini-3-flash-preview",
             contents: prompt,
             config: {
@@ -1515,7 +2091,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
                 },
                 required: ["isEntryFile", "reason_en", "reason_zh"]
               }
-            }
+            },
+            operation: 'verify-entry-file',
+            context: { filePath },
           });
           const usage = recordAiUsage(response);
 
@@ -1617,7 +2195,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
         }
       );
 
-      const response = await ai.models.generateContent({
+      const response = await generateContentWithRetry({
+        ai,
         model: "gemini-3.1-pro-preview",
         contents: prompt,
         config: {
@@ -1634,7 +2213,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             },
             required: ["summary_en", "summary_zh", "primaryLanguage_en", "primaryLanguage_zh", "techStack", "entryFiles"]
           }
-        }
+        },
+        operation: 'repository-analysis',
+        context: { fileCount: filePaths.slice(0, 2000).length },
       });
       const usage = recordAiUsage(response);
 
