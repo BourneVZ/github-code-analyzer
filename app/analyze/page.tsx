@@ -2,7 +2,7 @@
 
 import { useState, useEffect, Suspense, useRef, useMemo } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2, Layers } from 'lucide-react';
+import { Github, Search, Loader2, AlertCircle, ArrowLeft, FileCode, Sparkles, ChevronDown, ChevronRight, Terminal, CheckCircle2, Info, XCircle, Languages, Maximize2, Minimize2, PanelLeft, PanelRight, Code2, Layers, Settings2 } from 'lucide-react';
 import { FileTree } from '@/components/FileTree';
 import type { FileNode, GithubNode } from '@/lib/github';
 import { CodeViewer } from '@/components/CodeViewer';
@@ -12,6 +12,8 @@ import { createGithubDataSource, createLocalDataSource, DataSourceError, type Co
 import { buildEngineeringMarkdown, buildHistoryId, getAnalysisHistoryById, saveAnalysisHistoryRecord, type AiAnalysisSnapshot, type AnalysisHistoryRecord, type ConfirmedEntrySnapshot, type RepoInfoSnapshot, type StoredFunctionModule, type StoredLogEntry, type StoredSubFunctionNode } from '@/lib/analysisHistory';
 import { GoogleGenAI, Type } from "@google/genai";
 import { Group, Panel, Separator } from 'react-resizable-panels';
+import { SettingsModal } from '@/components/SettingsModal';
+import { getAppSettings } from '@/lib/appSettings';
 
 type LocalizedString = { en: string; zh: string };
 
@@ -180,6 +182,7 @@ function AnalyzeContent() {
   const [isMarkdownFullscreen, setIsMarkdownFullscreen] = useState(false);
   const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>({ inputTokens: 0, outputTokens: 0, totalCalls: 0 });
   const [manualDrilldownNodeId, setManualDrilldownNodeId] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const lastFetchedUrl = useRef('');
   const lastSavedHistoryHash = useRef('');
   const activeDataSourceRef = useRef<CodeDataSource | null>(null);
@@ -190,7 +193,9 @@ function AnalyzeContent() {
   const moduleColorPalette = ['#38bdf8', '#34d399', '#f59e0b', '#f97316', '#a78bfa', '#fb7185', '#2dd4bf', '#84cc16', '#eab308', '#60a5fa'];
 
   const resolveGeminiEndpoint = () => {
+    const appSettings = getAppSettings();
     const rawBaseUrl =
+      appSettings.aiBaseUrl ||
       process.env.NEXT_PUBLIC_GEMINI_BASE_URL ||
       process.env.GEMINI_BASE_URL ||
       "https://generativelanguage.googleapis.com";
@@ -204,7 +209,11 @@ function AnalyzeContent() {
   };
 
   const createGeminiClient = () => {
-    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    const appSettings = getAppSettings();
+    const apiKey =
+      appSettings.aiApiKey ||
+      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+      process.env.GEMINI_API_KEY;
     if (!apiKey) return null;
 
     const endpoint = resolveGeminiEndpoint();
@@ -368,17 +377,9 @@ function AnalyzeContent() {
   };
 
   const getGeminiRetryPolicy = () => {
-    const maxRetriesRaw =
-      process.env.NEXT_PUBLIC_GEMINI_RETRY_MAX_RETRIES ||
-      process.env.GEMINI_RETRY_MAX_RETRIES ||
-      '2';
-    const baseDelayRaw =
-      process.env.NEXT_PUBLIC_GEMINI_RETRY_BASE_DELAY_MS ||
-      process.env.GEMINI_RETRY_BASE_DELAY_MS ||
-      '600';
-
-    const maxRetries = Math.min(Math.max(Number.parseInt(maxRetriesRaw, 10) || 2, 0), 6);
-    const baseDelayMs = Math.min(Math.max(Number.parseInt(baseDelayRaw, 10) || 600, 150), 10_000);
+    const appSettings = getAppSettings();
+    const maxRetries = Math.min(Math.max(Number.parseInt(String(appSettings.retryMaxRetries), 10) || 0, 0), 10);
+    const baseDelayMs = Math.min(Math.max(Number.parseInt(String(appSettings.retryBaseDelayMs), 10) || 600, 100), 10_000);
     return { maxRetries, baseDelayMs };
   };
 
@@ -446,7 +447,10 @@ function AnalyzeContent() {
     throw lastErr instanceof Error ? lastErr : new Error('Unknown AI request error');
   };
 
-  const getGithubToken = () => process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
+  const getGithubToken = () => {
+    const appSettings = getAppSettings();
+    return appSettings.githubToken || process.env.NEXT_PUBLIC_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
+  };
 
   const getGithubTokenMeta = () => {
     const token = getGithubToken();
@@ -629,13 +633,22 @@ function AnalyzeContent() {
   };
 
   const getMaxDrillDownDepth = () => {
-    const raw =
-      process.env.NEXT_PUBLIC_GEMINI_DRILLDOWN_MAX_DEPTH ||
-      process.env.GEMINI_DRILLDOWN_MAX_DEPTH ||
-      '2';
-    const parsed = Number.parseInt(raw, 10);
+    const appSettings = getAppSettings();
+    const parsed = Number.parseInt(String(appSettings.maxDrillDownDepth), 10);
     if (Number.isNaN(parsed)) return 2;
     return Math.min(Math.max(parsed, 0), 6);
+  };
+
+  const getAiModelName = () => {
+    const appSettings = getAppSettings();
+    return appSettings.aiModel || 'gemini-3-flash-preview';
+  };
+
+  const getKeySubFunctionCount = () => {
+    const appSettings = getAppSettings();
+    const parsed = Number.parseInt(String(appSettings.keySubFunctionCount), 10);
+    if (Number.isNaN(parsed)) return 10;
+    return Math.min(Math.max(parsed, 1), 30);
   };
 
   const fetchFileText = async (_repo: RepoRef, filePath: string) => {
@@ -983,9 +996,10 @@ Files:
 ${fileList}`;
 
     try {
+      const aiModel = getAiModelName();
       const guessResp = await generateContentWithRetry({
         ai,
-        model: "gemini-3-flash-preview",
+        model: aiModel,
         contents: guessPrompt,
         config: {
           responseMimeType: "application/json",
@@ -1744,6 +1758,8 @@ ${fileList}`;
         throw new Error('Entry file content is empty');
       }
       const text = entryContent.text;
+      const aiModel = getAiModelName();
+      const keyCallLimit = getKeySubFunctionCount();
       
       const fileList = allFiles.slice(0, 1000).join('\n');
       
@@ -1766,7 +1782,7 @@ Rules:
 2) EXCLUDE routine utilities and low-value operations: common data structure operations, simple string helpers, trivial getters/setters, and generic framework lifecycle hooks.
 3) For object-oriented languages, if a function belongs to class/namespace, the name must include class scope (example: ClassName::FunctionName).
 
-Identify up to 20 key sub-functions called within this entry file. For each sub-function, provide:
+Identify up to ${keyCallLimit} key sub-functions called within this entry file. For each sub-function, provide:
 1. name: The name of the sub-function.
 2. file: The likely file path where this sub-function is defined (guess based on the available files and context).
 3. description_en: A brief description of what this sub-function likely does (in English).
@@ -1774,10 +1790,10 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
 5. drillDown: Whether it's worth further drill-down analysis (-1 for no, 0 for unsure, 1 for yes).`;
 
       const aiRequest = {
-        model: "gemini-3-flash-preview",
+        model: aiModel,
         baseUrl: resolveGeminiEndpoint().baseUrl,
         apiVersion: resolveGeminiEndpoint().apiVersion,
-        url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
+        url: `${resolveGeminiEndpoint().requestUrl}/models/${aiModel}:generateContent`,
         prompt,
       };
       aiCallLogId = addAiCallLog(
@@ -1787,7 +1803,7 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
 
       const response = await generateContentWithRetry({
         ai,
-        model: "gemini-3-flash-preview",
+        model: aiModel,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -1936,7 +1952,9 @@ Identify up to 20 key sub-functions called within this entry file. For each sub-
             );
 
             const fileList = allFiles.slice(0, 1500).join('\n');
-            const prompt = `Analyze the function below and identify up to 12 key child function calls that are part of the CORE business/control flow.
+            const keyCallLimit = getKeySubFunctionCount();
+            const aiModel = getAiModelName();
+            const prompt = `Analyze the function below and identify up to ${keyCallLimit} key child function calls that are part of the CORE business/control flow.
 Project URL: ${targetUrl}
 Project Summary: ${analysisContext.summary_en}
 Caller Function: ${functionName}
@@ -1955,7 +1973,7 @@ Strict rules:
 1) Return ONLY child calls that are essential to core feature flow, business logic transitions, orchestration, external system interactions, or critical error handling.
 2) EXCLUDE generic utilities and low-value operations: plain data structure ops (map/filter/reduce/forEach/push/pop/sort), string formatting/parsing helpers, trivial getters/setters, logging wrappers, and basic framework lifecycle hooks.
 3) For object-oriented languages, if a call belongs to a class/namespace, name MUST use full qualified form (example: ClassName::FunctionName). Do not return only FunctionName in this case.
-4) Keep max 12 results and prioritize impact on end-to-end behavior.
+4) Keep max ${keyCallLimit} results and prioritize impact on end-to-end behavior.
 
 For each child function return:
 1) name
@@ -1967,10 +1985,10 @@ For each child function return:
             const aiCallLogId = addAiCallLog(
               { en: `AI drill-down analyzing ${functionName}...`, zh: `AI 正在下钻分析 ${functionName}...` },
               {
-                model: 'gemini-3-flash-preview',
+                model: aiModel,
                 baseUrl: endpoint.baseUrl,
                 apiVersion: endpoint.apiVersion,
-                url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
+                url: `${endpoint.requestUrl}/models/${aiModel}:generateContent`,
                 depth,
                 maxDepth,
                 functionName,
@@ -1982,7 +2000,7 @@ For each child function return:
             try {
               const response = await generateContentWithRetry({
                 ai,
-                model: 'gemini-3-flash-preview',
+                model: aiModel,
                 contents: prompt,
                 config: {
                   responseMimeType: 'application/json',
@@ -2398,6 +2416,7 @@ For each child function return:
       }
 
       const endpoint = resolveGeminiEndpoint();
+      const aiModel = getAiModelName();
       const compactNodes = nodes.slice(0, 1200).map((node) => ({
         id: node.id,
         name: node.name,
@@ -2424,10 +2443,10 @@ ${JSON.stringify(compactNodes)}`;
       aiCallLogId = addAiCallLog(
         { en: 'Function module grouping AI call', zh: '函数模块划分 AI 调用' },
         {
-          model: 'gemini-3.1-pro-preview',
+          model: aiModel,
           baseUrl: endpoint.baseUrl,
           apiVersion: endpoint.apiVersion,
-          url: `${endpoint.requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
+          url: `${endpoint.requestUrl}/models/${aiModel}:generateContent`,
           nodeCount: compactNodes.length,
           prompt,
         }
@@ -2435,7 +2454,7 @@ ${JSON.stringify(compactNodes)}`;
 
       const response = await generateContentWithRetry({
         ai,
-        model: 'gemini-3.1-pro-preview',
+        model: aiModel,
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -2610,13 +2629,14 @@ ${contentToSend}
 Determine if this file is the main entry point. Provide your reasoning.`;
 
           addLog({ en: `Verifying ${filePath} with AI...`, zh: `正在使用 AI 验证 ${filePath}...` }, 'info');
+          const aiModel = getAiModelName();
           aiCallLogId = addAiCallLog(
             { en: `Entry verification AI call: ${filePath}`, zh: `入口验证 AI 调用: ${filePath}` },
             {
-              model: "gemini-3-flash-preview",
+              model: aiModel,
               baseUrl: resolveGeminiEndpoint().baseUrl,
               apiVersion: resolveGeminiEndpoint().apiVersion,
-              url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3-flash-preview:generateContent`,
+              url: `${resolveGeminiEndpoint().requestUrl}/models/${aiModel}:generateContent`,
               promptLength: prompt.length,
               prompt,
             }
@@ -2624,7 +2644,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
           const response = await generateContentWithRetry({
             ai,
-            model: "gemini-3-flash-preview",
+            model: aiModel,
             contents: prompt,
             config: {
               responseMimeType: "application/json",
@@ -2724,6 +2744,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       }
       
       // Limit to 2000 files to avoid excessive token usage
+      const aiModel = getAiModelName();
       const pathsToAnalyze = filePaths.slice(0, 2000).join('\n');
       const prompt = `Analyze the following list of file paths from a GitHub repository. Determine the primary programming language, the technology stack (frameworks, libraries, tools), the likely main entry files, and provide a brief project summary based on the file structure.\n\nFiles:\n${pathsToAnalyze}`;
 
@@ -2731,10 +2752,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       aiCallLogId = addAiCallLog(
         { en: 'Repository analysis AI call', zh: '仓库分析 AI 调用' },
         {
-          model: "gemini-3.1-pro-preview",
+          model: aiModel,
           baseUrl: resolveGeminiEndpoint().baseUrl,
           apiVersion: resolveGeminiEndpoint().apiVersion,
-          url: `${resolveGeminiEndpoint().requestUrl}/models/gemini-3.1-pro-preview:generateContent`,
+          url: `${resolveGeminiEndpoint().requestUrl}/models/${aiModel}:generateContent`,
           promptLength: prompt.length,
           filesCount: filePaths.slice(0, 2000).length,
           prompt,
@@ -2743,7 +2764,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
       const response = await generateContentWithRetry({
         ai,
-        model: "gemini-3.1-pro-preview",
+        model: aiModel,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -3317,7 +3338,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
         const endpoint = resolveGeminiEndpoint();
         const fileList = allFiles.slice(0, 1500).join('\n');
-        const prompt = `Analyze the function below and identify up to 12 key child function calls that are part of the CORE business/control flow.
+        const keyCallLimit = getKeySubFunctionCount();
+        const aiModel = getAiModelName();
+        const prompt = `Analyze the function below and identify up to ${keyCallLimit} key child function calls that are part of the CORE business/control flow.
 Project URL: ${url}
 Project Summary: ${aiAnalysis?.summary_en || ''}
 Caller Function: ${target.name}
@@ -3336,7 +3359,7 @@ Strict rules:
 1) Return ONLY child calls that are essential to core feature flow, business logic transitions, orchestration, external system interactions, or critical error handling.
 2) EXCLUDE generic utilities and low-value operations: plain data structure ops (map/filter/reduce/forEach/push/pop/sort), string formatting/parsing helpers, trivial getters/setters, logging wrappers, and basic framework lifecycle hooks.
 3) For object-oriented languages, if a call belongs to a class/namespace, name MUST use full qualified form (example: ClassName::FunctionName). Do not return only FunctionName in this case.
-4) Keep max 12 results and prioritize impact on end-to-end behavior.
+4) Keep max ${keyCallLimit} results and prioritize impact on end-to-end behavior.
 5) Return direct child calls only, do not expand grandchildren.
 
 For each child function return:
@@ -3349,10 +3372,10 @@ For each child function return:
         const aiCallLogId = addAiCallLog(
           { en: `AI manual drill-down analyzing ${target.name}...`, zh: `AI 正在手动下钻分析 ${target.name}...` },
           {
-            model: 'gemini-3-flash-preview',
+            model: aiModel,
             baseUrl: endpoint.baseUrl,
             apiVersion: endpoint.apiVersion,
-            url: `${endpoint.requestUrl}/models/gemini-3-flash-preview:generateContent`,
+            url: `${endpoint.requestUrl}/models/${aiModel}:generateContent`,
             functionName: target.name,
             functionFile: located.file,
             depth: target.depth ?? 0,
@@ -3364,7 +3387,7 @@ For each child function return:
         try {
           const response = await generateContentWithRetry({
             ai,
-            model: 'gemini-3-flash-preview',
+            model: aiModel,
             contents: prompt,
             config: {
               responseMimeType: 'application/json',
@@ -3527,6 +3550,13 @@ For each child function return:
               <PanelRight className="w-4 h-4" />
             </button>
           </div>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="flex items-center px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-100 transition-colors shadow-sm"
+          >
+            <Settings2 className="w-4 h-4 mr-1.5 text-indigo-500" />
+            {lang === 'en' ? 'Settings' : '设置'}
+          </button>
           <button 
             onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
             className="flex items-center px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-100 transition-colors shadow-sm"
@@ -4198,6 +4228,8 @@ For each child function return:
           </div>
         </div>
       )}
+
+      {showSettings ? <SettingsModal onClose={() => setShowSettings(false)} lang={lang} /> : null}
     </div>
   );
 }

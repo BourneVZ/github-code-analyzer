@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import {
   Github,
   FolderSearch,
+  Settings2,
   Search,
   AlertCircle,
   Languages,
@@ -20,6 +21,7 @@ import {
   type AnalysisHistoryRecord,
 } from '@/lib/analysisHistory';
 import { registerLocalDirectorySession } from '@/lib/localSession';
+import { SettingsModal } from '@/components/SettingsModal';
 
 type AnalyzerMode = 'github' | 'local';
 
@@ -28,6 +30,7 @@ export default function Home() {
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
   const [lang, setLang] = useState<'en' | 'zh'>('zh');
+  const [showSettings, setShowSettings] = useState(false);
   const historyRecords = useSyncExternalStore(
     subscribeAnalysisHistory,
     getAnalysisHistory,
@@ -151,13 +154,22 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 relative">
-      <button
-        onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
-        className="absolute top-4 right-4 flex items-center px-3 py-1.5 bg-white border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors shadow-sm"
-      >
-        <Languages className="w-4 h-4 mr-1.5 text-indigo-500" />
-        {lang === 'en' ? '中文' : 'English'}
-      </button>
+      <div className="absolute top-4 right-4 flex items-center gap-2">
+        <button
+          onClick={() => setShowSettings(true)}
+          className="flex items-center px-3 py-1.5 bg-white border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors shadow-sm"
+        >
+          <Settings2 className="w-4 h-4 mr-1.5 text-indigo-500" />
+          {lang === 'en' ? 'Settings' : '设置'}
+        </button>
+        <button
+          onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
+          className="flex items-center px-3 py-1.5 bg-white border border-slate-200 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors shadow-sm"
+        >
+          <Languages className="w-4 h-4 mr-1.5 text-indigo-500" />
+          {lang === 'en' ? '中文' : 'English'}
+        </button>
+      </div>
 
       <div className="max-w-4xl w-full space-y-8 text-center">
         <div className="flex flex-col items-center justify-center space-y-4">
@@ -299,7 +311,8 @@ export default function Home() {
           )}
         </section>
       </div>
+
+      {showSettings ? <SettingsModal onClose={() => setShowSettings(false)} lang={lang} /> : null}
     </div>
   );
 }
-
