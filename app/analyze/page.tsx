@@ -141,6 +141,7 @@ function AnalyzeContent() {
   const [isLogsFullscreen, setIsLogsFullscreen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [projectNotice, setProjectNotice] = useState('');
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [selectedFile, setSelectedFile] = useState<FileNode | null>(null);
   const [fileContent, setFileContent] = useState('');
@@ -2818,6 +2819,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setWorkflow('working', 'Starting workflow...', '工作流启动中...');
     setLoading(true);
     setError('');
+    setProjectNotice('');
     setFileTree([]);
     setSelectedFile(null);
     setFileContent('');
@@ -2963,6 +2965,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setUrl(record.projectUrl);
     setLang(record.lang);
     setError('');
+    setProjectNotice('');
     setLoading(false);
     setIsAnalyzing(false);
     setIsVerifyingEntry(false);
@@ -2988,7 +2991,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setWorkflow('completed', 'Loaded from history', '已加载历史记录');
 
     if (record.repoInfo?.kind === 'local' && !localSessionId) {
-      setError(
+      setProjectNotice(
         lang === 'en'
           ? 'This is a local-project history snapshot. Re-select the local folder on home page if you need to open file content.'
           : '这是本地项目历史快照。如需重新打开文件内容，请回到首页重新选择本地目录。'
@@ -3013,6 +3016,25 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
     const projectName = repoInfo.name || (repoInfo.owner && repoInfo.repo ? `${repoInfo.owner}/${repoInfo.repo}` : 'Unknown Project');
     const recordId = buildHistoryId(repoInfo as RepoInfoSnapshot, url);
+    const existingRecord = getAnalysisHistoryById(recordId);
+    const canBorrowFromHistory = workflowStatus.state === 'working' || workflowStatus.state === 'error';
+    const effectiveAiAnalysis =
+      aiAnalysis || (canBorrowFromHistory ? ((existingRecord?.aiAnalysis as AiAnalysisSnapshot | null) || null) : null);
+    const effectiveConfirmedEntryFile =
+      confirmedEntryFile ||
+      (canBorrowFromHistory ? ((existingRecord?.confirmedEntryFile as ConfirmedEntrySnapshot | null) || null) : null);
+    const effectiveSubFunctions =
+      subFunctions.length > 0
+        ? subFunctions
+        : canBorrowFromHistory
+          ? ((existingRecord?.subFunctions as StoredSubFunctionNode[] | undefined) || [])
+          : [];
+    const effectiveFunctionModules =
+      functionModules.length > 0
+        ? functionModules
+        : canBorrowFromHistory
+          ? ((existingRecord?.functionModules as StoredFunctionModule[] | undefined) || [])
+          : [];
     const serializedLogs = serializeLogs(logs);
     const snapshotWithoutMarkdown = {
       id: recordId,
@@ -3020,13 +3042,13 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       projectName,
       lang,
       repoInfo,
-      aiAnalysis,
-      confirmedEntryFile,
+      aiAnalysis: effectiveAiAnalysis,
+      confirmedEntryFile: effectiveConfirmedEntryFile,
       allFilePaths,
       codeFiles: codeFilesList,
       fileTreeNodes,
-      subFunctions,
-      functionModules,
+      subFunctions: effectiveSubFunctions,
+      functionModules: effectiveFunctionModules,
       agentLogs: serializedLogs,
       aiUsageStats,
     };
@@ -3054,7 +3076,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     } catch (err) {
       console.warn('Failed to save analysis history:', err);
     }
-  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs, aiUsageStats]);
+  }, [url, lang, repoInfo, aiAnalysis, confirmedEntryFile, allFilePaths, codeFilesList, fileTreeNodes, subFunctions, functionModules, logs, aiUsageStats, workflowStatus.state]);
 
   const engineeringMarkdownPreview = useMemo(() => {
     if (!repoInfo && !aiAnalysis && !subFunctions.length && !logs.length) return '';
@@ -3857,6 +3879,12 @@ For each child function return:
                 </div>
               ) : fileTree.length > 0 && repoInfo ? (
                 <div className="space-y-4">
+                  {projectNotice ? (
+                    <div className="flex items-start text-sm text-amber-700 bg-amber-50 p-3 rounded-md border border-amber-200">
+                      <AlertCircle className="w-4 h-4 mr-2 shrink-0 mt-0.5" />
+                      <span>{projectNotice}</span>
+                    </div>
+                  ) : null}
                   <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
                     <div className="text-sm font-medium text-slate-900 mb-1">
                       {repoInfo.kind === 'local' ? 'Local Project' : 'Repository'}
