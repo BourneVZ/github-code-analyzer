@@ -7,7 +7,8 @@ import { FileTree } from '@/components/FileTree';
 import type { FileNode, GithubNode } from '@/lib/github';
 import { CodeViewer } from '@/components/CodeViewer';
 import { Panorama } from '@/components/Panorama';
-import { parseGithubUrl, buildFileTree, getLanguageFromFilename, getCodeFiles } from '@/lib/github';
+import { buildFileTree, getLanguageFromFilename } from '@/lib/github';
+import { createGithubDataSource, createLocalDataSource, DataSourceError, type CodeDataSource } from '@/lib/dataSource';
 import { buildEngineeringMarkdown, buildHistoryId, getAnalysisHistoryById, saveAnalysisHistoryRecord, type AiAnalysisSnapshot, type AnalysisHistoryRecord, type ConfirmedEntrySnapshot, type RepoInfoSnapshot, type StoredFunctionModule, type StoredLogEntry, type StoredSubFunctionNode } from '@/lib/analysisHistory';
 import { GoogleGenAI, Type } from "@google/genai";
 import { Group, Panel, Separator } from 'react-resizable-panels';
@@ -23,7 +24,7 @@ type LogEntry = {
   expanded?: boolean;
 };
 
-type RepoRef = { owner: string; repo: string; branch: string };
+type RepoRef = { owner: string; repo: string; branch: string; kind?: 'github' | 'local'; name?: string };
 type GithubEndpointKind = 'api' | 'raw';
 
 class GithubRequestError extends Error {
@@ -129,6 +130,8 @@ function AnalyzeContent() {
   const router = useRouter();
   const initialUrl = searchParams.get('url') || '';
   const historyId = searchParams.get('historyId') || '';
+  const initialMode = searchParams.get('mode') === 'local' ? 'local' : 'github';
+  const localSessionId = searchParams.get('sessionId') || '';
   const initialLang = (searchParams.get('lang') as 'en' | 'zh') || 'zh';
   
   const [url, setUrl] = useState(initialUrl);
@@ -140,7 +143,7 @@ function AnalyzeContent() {
   const [selectedFile, setSelectedFile] = useState<FileNode | null>(null);
   const [fileContent, setFileContent] = useState('');
   const [contentLoading, setContentLoading] = useState(false);
-  const [repoInfo, setRepoInfo] = useState<{owner: string, repo: string, branch: string} | null>(null);
+  const [repoInfo, setRepoInfo] = useState<RepoInfoSnapshot | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<{
     summary_en: string;
     summary_zh: string;
@@ -179,6 +182,7 @@ function AnalyzeContent() {
   const [manualDrilldownNodeId, setManualDrilldownNodeId] = useState<string | null>(null);
   const lastFetchedUrl = useRef('');
   const lastSavedHistoryHash = useRef('');
+  const activeDataSourceRef = useRef<CodeDataSource | null>(null);
   const fetchIdRef = useRef(0);
   const drillDownCacheRef = useRef<Map<string, any[]>>(new Map());
   const functionLocationCacheRef = useRef<Map<string, LocatedFunction | null>>(new Map());
@@ -634,113 +638,38 @@ function AnalyzeContent() {
     return Math.min(Math.max(parsed, 0), 6);
   };
 
-  const fetchFileText = async (repo: RepoRef, filePath: string) => {
-    const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${filePath}`;
+  const fetchFileText = async (_repo: RepoRef, filePath: string) => {
+    const source = activeDataSourceRef.current;
+    if (!source) {
+      throw new GithubRequestError('Data source is not initialized', {
+        operation: 'Read file',
+        filePath,
+      });
+    }
 
     try {
-      // Avoid Authorization on raw endpoint to reduce browser preflight/CORS failures.
-      const rawRes = await fetch(rawUrl);
-      if (rawRes.ok) {
-        return { text: await rawRes.text(), rawUrl, source: 'raw' as const };
-      }
-      if (rawRes.status !== 404) {
-        await buildGithubErrorFromResponse(rawRes, {
-          endpoint: 'raw',
-          operation: 'Fetch raw file',
-          url: rawUrl,
-          owner: repo.owner,
-          repo: repo.repo,
-          branch: repo.branch,
+      const result = await source.readFile(filePath);
+      return {
+        text: result.text,
+        rawUrl: filePath,
+        source: result.source as 'raw' | 'api',
+      };
+    } catch (err) {
+      if (err instanceof GithubRequestError) throw err;
+      if (err instanceof DataSourceError) {
+        throw new GithubRequestError(err.message, {
+          operation: 'Read file',
           filePath,
+          source: source.kind,
+          ...(err.details || {}),
         });
       }
-    } catch (rawErr) {
-      const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(repo.branch)}`;
-      try {
-        const apiRes = await fetch(apiUrl, { headers: getGithubApiHeaders() });
-        if (!apiRes.ok) {
-          await buildGithubErrorFromResponse(apiRes, {
-            endpoint: 'api',
-            operation: 'Fetch file content via GitHub contents API',
-            url: apiUrl,
-            owner: repo.owner,
-            repo: repo.repo,
-            branch: repo.branch,
-            filePath,
-          });
-        }
-        const payload = await apiRes.json();
-        if (!payload?.content || payload?.encoding !== 'base64') {
-          throw new GithubRequestError('Unexpected contents API payload', {
-            endpoint: 'api',
-            operation: 'Decode contents API response',
-            url: apiUrl,
-            owner: repo.owner,
-            repo: repo.repo,
-            branch: repo.branch,
-            filePath,
-            payloadShape: {
-              hasContent: Boolean(payload?.content),
-              encoding: payload?.encoding,
-              type: payload?.type,
-            },
-          });
-        }
-        return {
-          text: decodeBase64Utf8(payload.content),
-          rawUrl,
-          source: 'api' as const,
-        };
-      } catch (apiErr) {
-        if (apiErr instanceof GithubRequestError) throw apiErr;
-        buildGithubErrorFromException(apiErr, {
-          endpoint: 'api',
-          operation: 'Fetch file content via GitHub contents API',
-          url: apiUrl,
-          owner: repo.owner,
-          repo: repo.repo,
-          branch: repo.branch,
-          filePath,
-        });
-      }
-    }
-
-    const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(repo.branch)}`;
-    const apiRes = await fetch(apiUrl, { headers: getGithubApiHeaders() });
-    if (!apiRes.ok) {
-      await buildGithubErrorFromResponse(apiRes, {
-        endpoint: 'api',
-        operation: 'Fetch file content via GitHub contents API',
-        url: apiUrl,
-        owner: repo.owner,
-        repo: repo.repo,
-        branch: repo.branch,
+      throw new GithubRequestError(toErrorMessage(err), {
+        operation: 'Read file',
         filePath,
+        source: source.kind,
       });
     }
-    const payload = await apiRes.json();
-    if (!payload?.content || payload?.encoding !== 'base64') {
-      throw new GithubRequestError('Unexpected contents API payload', {
-        endpoint: 'api',
-        operation: 'Decode contents API response',
-        url: apiUrl,
-        owner: repo.owner,
-        repo: repo.repo,
-        branch: repo.branch,
-        filePath,
-        payloadShape: {
-          hasContent: Boolean(payload?.content),
-          encoding: payload?.encoding,
-          type: payload?.type,
-        },
-      });
-    }
-
-    return {
-      text: decodeBase64Utf8(payload.content),
-      rawUrl,
-      source: 'api' as const,
-    };
   };
 
   const isLikelySystemOrLibraryFunction = (name: string) => {
@@ -943,24 +872,109 @@ function AnalyzeContent() {
   }): Promise<LocatedFunction | null> => {
     if (currentFetchId !== fetchIdRef.current) return null;
 
+    addLog(
+      {
+        en: `Function locate start: ${functionName}`,
+        zh: `开始函数定位: ${functionName}`,
+      },
+      'info',
+      {
+        strategyOrder: ['same-file', 'ai-guess-files', 'datasource-content-search'],
+        functionName,
+        parentFile,
+        fileCount: allFiles.length,
+      }
+    );
+
     // Stage 1: same file as parent caller
     if (parentFile) {
+      addLog(
+        {
+          en: `Locate strategy #1 (same-file) started: ${parentFile}`,
+          zh: `定位策略 #1（同文件）开始: ${parentFile}`,
+        },
+        'info',
+        { strategy: 'same-file', parentFile, functionName }
+      );
       try {
         const parentFileContent = await fetchFileText(repo, parentFile);
         if (parentFileContent) {
           const inParent = findFunctionInFile(parentFileContent.text, functionName);
           if (inParent) {
+            addLog(
+              {
+                en: `Locate strategy #1 hit: ${functionName} in ${parentFile}:${inParent.lineStart}`,
+                zh: `定位策略 #1 命中: ${functionName} 位于 ${parentFile}:${inParent.lineStart}`,
+              },
+              'success',
+              {
+                strategy: 'same-file',
+                file: parentFile,
+                lineStart: inParent.lineStart,
+                lineEnd: inParent.lineEnd,
+              }
+            );
+            addLog(
+              {
+                en: 'Locate strategy #2/#3 skipped because strategy #1 already matched.',
+                zh: '定位策略 #2/#3 已跳过（策略 #1 已命中）。',
+              },
+              'info',
+              { skipped: ['ai-guess-files', 'datasource-content-search'] }
+            );
             return { ...inParent, file: parentFile };
           }
         }
+        addLog(
+          {
+            en: `Locate strategy #1 miss: not found in ${parentFile}`,
+            zh: `定位策略 #1 未命中: 在 ${parentFile} 未找到`,
+          },
+          'info',
+          { strategy: 'same-file', parentFile, functionName }
+        );
       } catch (err) {
+        addLog(
+          {
+            en: `Locate strategy #1 failed: ${toErrorMessage(err)}`,
+            zh: `定位策略 #1 失败: ${toErrorMessage(err)}`,
+          },
+          'warning',
+          buildErrorDiagnostics(err, {
+            strategy: 'same-file',
+            functionName,
+            parentFile,
+          })
+        );
         if (!isGithubNotFoundError(err)) {
           // Continue to next stages on transient fetch/network failures.
         }
       }
+    } else {
+      addLog(
+        {
+          en: 'Locate strategy #1 skipped: parent file is empty.',
+          zh: '定位策略 #1 已跳过：父文件为空。',
+        },
+        'info',
+        { strategy: 'same-file', functionName }
+      );
     }
 
     // Stage 2: let AI guess likely files from file list
+    addLog(
+      {
+        en: `Locate strategy #2 (AI guessed files) started for ${functionName}`,
+        zh: `定位策略 #2（AI 猜测文件）开始: ${functionName}`,
+      },
+      'info',
+      {
+        strategy: 'ai-guess-files',
+        functionName,
+        parentFile,
+        filePoolSize: Math.min(allFiles.length, 2000),
+      }
+    );
     const fileList = allFiles.slice(0, 2000).join('\n');
     const guessPrompt = `Given a repository file list and a function name, return up to 8 likely file paths where the function is defined.
 Function: ${normalizeCalledFunctionName(functionName).normalized || functionName}
@@ -993,37 +1007,219 @@ ${fileList}`;
 
       if (guessResp.text) {
         const guessed = JSON.parse(guessResp.text)?.candidateFiles || [];
+        addLog(
+          {
+            en: `Locate strategy #2 candidates: ${guessed.length}`,
+            zh: `定位策略 #2 候选文件数: ${guessed.length}`,
+          },
+          'info',
+          {
+            strategy: 'ai-guess-files',
+            guessedCount: guessed.length,
+            guessedFiles: guessed.slice(0, 30),
+          }
+        );
+        let scanned = 0;
+        let skippedNotFound = 0;
+        let failedReads = 0;
         for (const file of guessed) {
           if (currentFetchId !== fetchIdRef.current) return null;
+          scanned += 1;
           try {
             const content = await fetchFileText(repo, file);
             if (!content) continue;
             const found = findFunctionInFile(content.text, functionName);
-            if (found) return { ...found, file };
-          } catch (err) {
-            if (!isGithubNotFoundError(err)) {
-              continue;
+            if (found) {
+              addLog(
+                {
+                  en: `Locate strategy #2 hit: ${functionName} in ${file}:${found.lineStart}`,
+                  zh: `定位策略 #2 命中: ${functionName} 位于 ${file}:${found.lineStart}`,
+                },
+                'success',
+                {
+                  strategy: 'ai-guess-files',
+                  scanned,
+                  guessedCount: guessed.length,
+                  file,
+                  lineStart: found.lineStart,
+                  lineEnd: found.lineEnd,
+                }
+              );
+              addLog(
+                {
+                  en: 'Locate strategy #3 skipped because strategy #2 already matched.',
+                  zh: '定位策略 #3 已跳过（策略 #2 已命中）。',
+                },
+                'info',
+                { skipped: ['datasource-content-search'] }
+              );
+              return { ...found, file };
             }
+          } catch (err) {
+            if (isGithubNotFoundError(err)) {
+              skippedNotFound += 1;
+            } else {
+              failedReads += 1;
+            }
+            continue;
           }
         }
+        addLog(
+          {
+            en: `Locate strategy #2 miss after scanning ${scanned} guessed files.`,
+            zh: `定位策略 #2 未命中，共扫描 ${scanned} 个候选文件。`,
+          },
+          'info',
+          {
+            strategy: 'ai-guess-files',
+            scanned,
+            guessedCount: guessed.length,
+            skippedNotFound,
+            failedReads,
+          }
+        );
+      } else {
+        addLog(
+          {
+            en: 'Locate strategy #2 returned empty AI response.',
+            zh: '定位策略 #2 返回空 AI 响应。',
+          },
+          'warning',
+          { strategy: 'ai-guess-files', functionName }
+        );
       }
-    } catch {
+    } catch (err) {
+      addLog(
+        {
+          en: `Locate strategy #2 failed: ${toErrorMessage(err)}`,
+          zh: `定位策略 #2 失败: ${toErrorMessage(err)}`,
+        },
+        'warning',
+        buildErrorDiagnostics(err, {
+          strategy: 'ai-guess-files',
+          functionName,
+          parentFile,
+        })
+      );
       // Continue to stage 3 on any AI-guess failure.
     }
 
-    // Stage 3: regex search across project files
-    for (const file of allFiles) {
-      if (currentFetchId !== fetchIdRef.current) return null;
-      try {
-        const content = await fetchFileText(repo, file);
-        if (!content) continue;
-        const found = findFunctionInFile(content.text, functionName);
-        if (found) return { ...found, file };
-      } catch {
-        continue;
+    // Stage 3: datasource-level content search, then precise parse.
+    const source = activeDataSourceRef.current;
+    addLog(
+      {
+        en: `Locate strategy #3 (datasource content search) started.`,
+        zh: `定位策略 #3（数据源内容搜索）开始。`,
+      },
+      'info',
+      {
+        strategy: 'datasource-content-search',
+        sourceKind: source?.kind || 'unknown',
+        functionName,
       }
+    );
+    if (source) {
+      const regexes = buildFunctionDefinitionRegexes(functionName);
+      const queryRegex = regexes[0] || new RegExp(`\\b${functionName}\\b`);
+      let candidateFiles: string[] = [];
+      try {
+        candidateFiles = await source.searchFileContent({
+          filePaths: allFiles,
+          query: queryRegex,
+          maxResults: 120,
+        });
+      } catch (err) {
+        addLog(
+          {
+            en: `Locate strategy #3 keyword search failed, fallback to full scan: ${toErrorMessage(err)}`,
+            zh: `定位策略 #3 关键字搜索失败，回退到全量扫描: ${toErrorMessage(err)}`,
+          },
+          'warning',
+          buildErrorDiagnostics(err, {
+            strategy: 'datasource-content-search',
+            functionName,
+          })
+        );
+        candidateFiles = [];
+      }
+
+      const scanList = candidateFiles.length ? candidateFiles : allFiles;
+      let scanned = 0;
+      let failedReads = 0;
+      addLog(
+        {
+          en: `Locate strategy #3 scan list prepared: ${scanList.length} files`,
+          zh: `定位策略 #3 扫描列表已准备: ${scanList.length} 个文件`,
+        },
+        'info',
+        {
+          strategy: 'datasource-content-search',
+          candidateFilesCount: candidateFiles.length,
+          scanListCount: scanList.length,
+          sampleFiles: scanList.slice(0, 30),
+        }
+      );
+      for (const file of scanList) {
+        if (currentFetchId !== fetchIdRef.current) return null;
+        scanned += 1;
+        try {
+          const content = await fetchFileText(repo, file);
+          if (!content) continue;
+          const found = findFunctionInFile(content.text, functionName);
+          if (found) {
+            addLog(
+              {
+                en: `Locate strategy #3 hit: ${functionName} in ${file}:${found.lineStart}`,
+                zh: `定位策略 #3 命中: ${functionName} 位于 ${file}:${found.lineStart}`,
+              },
+              'success',
+              {
+                strategy: 'datasource-content-search',
+                scanned,
+                file,
+                lineStart: found.lineStart,
+                lineEnd: found.lineEnd,
+              }
+            );
+            return { ...found, file };
+          }
+        } catch {
+          failedReads += 1;
+          continue;
+        }
+      }
+      addLog(
+        {
+          en: `Locate strategy #3 miss after scanning ${scanned} files.`,
+          zh: `定位策略 #3 未命中，共扫描 ${scanned} 个文件。`,
+        },
+        'warning',
+        {
+          strategy: 'datasource-content-search',
+          scanned,
+          failedReads,
+          functionName,
+        }
+      );
+    } else {
+      addLog(
+        {
+          en: 'Locate strategy #3 skipped: data source is unavailable.',
+          zh: '定位策略 #3 已跳过：数据源不可用。',
+        },
+        'warning',
+        { strategy: 'datasource-content-search', functionName }
+      );
     }
 
+    addLog(
+      {
+        en: `Function locate finished with no match: ${functionName}`,
+        zh: `函数定位结束，未匹配到定义: ${functionName}`,
+      },
+      'warning',
+      { functionName, parentFile }
+    );
     return null;
   };
 
@@ -2620,76 +2816,104 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     drillDownCacheRef.current.clear();
     functionLocationCacheRef.current.clear();
 
-    addLog({ en: `Validating GitHub URL: ${targetUrl}`, zh: `校验 GitHub URL: ${targetUrl}` }, 'info');
-    const parsed = parseGithubUrl(targetUrl);
-    if (!parsed) {
-      if (currentFetchId !== fetchIdRef.current) return;
-      setError(lang === 'en' ? 'Invalid GitHub URL' : '无效的 GitHub URL');
-      setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
-      addLog({ en: 'Invalid GitHub URL format.', zh: '无效的 GitHub URL 格式。' }, 'error');
-      setLoading(false);
-      return;
-    }
-
     try {
-      let branch = parsed.branch;
-      
-      // If branch is not specified, fetch the default branch
-      if (!branch) {
-        addLog({ en: `Fetching default branch for ${parsed.owner}/${parsed.repo}...`, zh: `正在获取 ${parsed.owner}/${parsed.repo} 的默认分支...` }, 'info');
-        const repoData = await fetchGithubApiJson<{ default_branch: string }>(
-          `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`,
-          `Fetch repository metadata for ${parsed.owner}/${parsed.repo}`
+      const source =
+        initialMode === 'local'
+          ? createLocalDataSource(localSessionId)
+          : createGithubDataSource();
+      activeDataSourceRef.current = source;
+
+      if (currentFetchId !== fetchIdRef.current) return;
+
+      if (source.kind === 'github') {
+        addLog({ en: `Validating GitHub URL: ${targetUrl}`, zh: `校验 GitHub URL: ${targetUrl}` }, 'info');
+      } else {
+        addLog({ en: 'Loading local project folder...', zh: '正在加载本地项目目录...' }, 'info');
+      }
+
+      const snapshot = await source.loadProject(targetUrl);
+      if (currentFetchId !== fetchIdRef.current) return;
+
+      const normalizedRepoInfo: RepoInfoSnapshot =
+        snapshot.project.kind === 'github'
+          ? {
+              kind: 'github',
+              owner: snapshot.project.owner || '',
+              repo: snapshot.project.repo || '',
+              branch: snapshot.project.branch || 'main',
+              name: snapshot.project.displayName,
+            }
+          : {
+              kind: 'local',
+              owner: 'local',
+              repo: snapshot.project.displayName,
+              branch: 'local',
+              name: snapshot.project.displayName,
+            };
+
+      setRepoInfo(normalizedRepoInfo);
+      if (snapshot.project.kind === 'github') {
+        addLog(
+          {
+            en: `GitHub validation successful. Target: ${snapshot.project.displayName} @ ${snapshot.project.branch || 'main'}`,
+            zh: `GitHub 校验成功。目标: ${snapshot.project.displayName} @ ${snapshot.project.branch || 'main'}`,
+          },
+          'success'
         );
-        branch = repoData.default_branch;
+      } else {
+        addLog(
+          {
+            en: `Local folder loaded: ${snapshot.project.displayName}`,
+            zh: `本地目录加载成功: ${snapshot.project.displayName}`,
+          },
+          'success'
+        );
       }
 
-      if (currentFetchId !== fetchIdRef.current) return;
-
-      setRepoInfo({ owner: parsed.owner, repo: parsed.repo, branch: branch || 'main' });
-      addLog({ en: `GitHub validation successful. Target: ${parsed.owner}/${parsed.repo} @ ${branch || 'main'}`, zh: `GitHub 校验成功。目标: ${parsed.owner}/${parsed.repo} @ ${branch || 'main'}` }, 'success');
-
-      // Fetch file tree
-      addLog({ en: `Fetching file tree from GitHub...`, zh: `正在从 GitHub 获取文件树...` }, 'info');
-      const treeData = await fetchGithubApiJson<{ truncated?: boolean; tree: any[] }>(
-        `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${branch}?recursive=1`,
-        `Fetch repository tree for ${parsed.owner}/${parsed.repo}@${branch}`
+      setFileTree(snapshot.fileTree);
+      setFileTreeNodes(snapshot.nodes as GithubNode[]);
+      setAllFilePaths(snapshot.allFiles);
+      setCodeFilesList(snapshot.codeFiles);
+      addLog(
+        {
+          en: `File tree fetched. Total files/directories: ${snapshot.nodes.length}`,
+          zh: `文件树获取成功。总文件/目录数: ${snapshot.nodes.length}`,
+        },
+        'success'
       );
-      if (currentFetchId !== fetchIdRef.current) return;
-
-      if (treeData.truncated) {
-        console.warn('Tree is truncated, some files might be missing');
-        addLog({ en: 'Tree is truncated, some files might be missing.', zh: '文件树被截断，可能缺少部分文件。' }, 'warning');
-      }
-      addLog({ en: `File tree fetched. Total files/directories: ${treeData.tree.length}`, zh: `文件树获取成功。总文件/目录数: ${treeData.tree.length}` }, 'success');
-
-      const tree = buildFileTree(treeData.tree);
-      setFileTree(tree);
-      setFileTreeNodes(treeData.tree as GithubNode[]);
-
-      const allFiles = treeData.tree
-        .filter((node: GithubNode) => node.type === 'blob')
-        .map((node: GithubNode) => node.path);
-      setAllFilePaths(allFiles);
-
-      // Trigger AI Analysis
-      const codeFiles = getCodeFiles(treeData.tree);
-      setCodeFilesList(codeFiles);
-      addLog({ en: `Filtered code files: ${codeFiles.length} files found.`, zh: `过滤后的代码文件: 找到 ${codeFiles.length} 个文件。` }, 'info', { files: codeFiles });
-      if (codeFiles.length > 0) {
-        analyzeWithAI(codeFiles, currentFetchId, { owner: parsed.owner, repo: parsed.repo, branch: branch || 'main' }, targetUrl);
+      addLog(
+        {
+          en: `Filtered code files: ${snapshot.codeFiles.length} files found.`,
+          zh: `过滤后的代码文件: 找到 ${snapshot.codeFiles.length} 个文件。`,
+        },
+        'info',
+        { files: snapshot.codeFiles }
+      );
+      if (snapshot.codeFiles.length > 0) {
+        analyzeWithAI(
+          snapshot.codeFiles,
+          currentFetchId,
+          {
+            owner: normalizedRepoInfo.owner || 'local',
+            repo: normalizedRepoInfo.repo || snapshot.project.displayName,
+            branch: normalizedRepoInfo.branch || 'local',
+            kind: normalizedRepoInfo.kind,
+            name: normalizedRepoInfo.name,
+          },
+          snapshot.project.projectUrl || targetUrl
+        );
       } else {
         setWorkflow('completed', 'Workflow completed (no code files)', '工作流结束（未找到代码文件）');
       }
     } catch (err: any) {
       if (currentFetchId !== fetchIdRef.current) return;
       setError(err.message || 'An error occurred while fetching data');
-      if (err instanceof GithubRequestError) {
+      if (err instanceof GithubRequestError || err instanceof DataSourceError) {
         setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
         addLog(
           { en: `Error: ${err.message}`, zh: `错误: ${err.message}` },
           'error',
-          { githubError: err.details }
+          { dataSourceError: (err as any).details || null }
         );
       } else {
         setWorkflow('error', 'Workflow ended with errors', '工作流异常结束');
@@ -2742,6 +2966,14 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setAiUsageStats((record as any).aiUsageStats || { inputTokens: 0, outputTokens: 0, totalCalls: 0 });
     setWorkflow('completed', 'Loaded from history', '已加载历史记录');
 
+    if (record.repoInfo?.kind === 'local' && !localSessionId) {
+      setError(
+        lang === 'en'
+          ? 'This is a local-project history snapshot. Re-select the local folder on home page if you need to open file content.'
+          : '这是本地项目历史快照。如需重新打开文件内容，请回到首页重新选择本地目录。'
+      );
+    }
+
     lastFetchedUrl.current = record.projectUrl;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyId]);
@@ -2758,7 +2990,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   useEffect(() => {
     if (!url.trim() || !repoInfo) return;
 
-    const projectName = `${repoInfo.owner}/${repoInfo.repo}`;
+    const projectName = repoInfo.name || (repoInfo.owner && repoInfo.repo ? `${repoInfo.owner}/${repoInfo.repo}` : 'Unknown Project');
     const recordId = buildHistoryId(repoInfo as RepoInfoSnapshot, url);
     const serializedLogs = serializeLogs(logs);
     const snapshotWithoutMarkdown = {
@@ -2806,7 +3038,9 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   const engineeringMarkdownPreview = useMemo(() => {
     if (!repoInfo && !aiAnalysis && !subFunctions.length && !logs.length) return '';
 
-    const projectName = repoInfo ? `${repoInfo.owner}/${repoInfo.repo}` : 'Unknown Project';
+    const projectName = repoInfo
+      ? repoInfo.name || (repoInfo.owner && repoInfo.repo ? `${repoInfo.owner}/${repoInfo.repo}` : 'Unknown Project')
+      : 'Unknown Project';
     const baseRecord: Omit<AnalysisHistoryRecord, 'engineeringMarkdown'> = {
       id: buildHistoryId((repoInfo as RepoInfoSnapshot | null) || null, url || projectName),
       savedAt: new Date().toISOString(),
@@ -2900,7 +3134,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   const handleAnalyze = (e: React.FormEvent) => {
     e.preventDefault();
     if (url !== initialUrl) {
-      router.push(`/analyze?url=${encodeURIComponent(url)}&lang=${lang}`);
+      router.push(`/analyze?mode=${initialMode}&url=${encodeURIComponent(url)}&lang=${lang}`);
     } else {
       lastFetchedUrl.current = url;
       fetchRepoData(url);
@@ -3594,13 +3828,19 @@ For each child function return:
               ) : fileTree.length > 0 && repoInfo ? (
                 <div className="space-y-4">
                   <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
-                    <div className="text-sm font-medium text-slate-900 mb-1">Repository</div>
-                    <div className="text-xs text-slate-500 break-all">{repoInfo.owner}/{repoInfo.repo}</div>
+                    <div className="text-sm font-medium text-slate-900 mb-1">
+                      {repoInfo.kind === 'local' ? 'Local Project' : 'Repository'}
+                    </div>
+                    <div className="text-xs text-slate-500 break-all">
+                      {repoInfo.name || (repoInfo.owner && repoInfo.repo ? `${repoInfo.owner}/${repoInfo.repo}` : 'N/A')}
+                    </div>
                   </div>
-                  <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
-                    <div className="text-sm font-medium text-slate-900 mb-1">Branch</div>
-                    <div className="text-xs text-slate-500">{repoInfo.branch}</div>
-                  </div>
+                  {repoInfo.kind !== 'local' ? (
+                    <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
+                      <div className="text-sm font-medium text-slate-900 mb-1">Branch</div>
+                      <div className="text-xs text-slate-500">{repoInfo.branch || 'main'}</div>
+                    </div>
+                  ) : null}
 
                   {/* AI Analysis Section */}
                   <div className="mt-6 pt-6 border-t border-slate-200">

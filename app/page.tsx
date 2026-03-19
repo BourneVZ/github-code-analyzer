@@ -2,10 +2,29 @@
 
 import { useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
-import { Github, Search, AlertCircle, Languages, History, Clock3, Trash2 } from 'lucide-react';
-import { getAnalysisHistory, getAnalysisHistoryServerSnapshot, removeAnalysisHistoryRecord, subscribeAnalysisHistory, type AnalysisHistoryRecord } from '@/lib/analysisHistory';
+import {
+  Github,
+  FolderSearch,
+  Search,
+  AlertCircle,
+  Languages,
+  History,
+  Clock3,
+  Trash2,
+} from 'lucide-react';
+import {
+  getAnalysisHistory,
+  getAnalysisHistoryServerSnapshot,
+  removeAnalysisHistoryRecord,
+  subscribeAnalysisHistory,
+  type AnalysisHistoryRecord,
+} from '@/lib/analysisHistory';
+import { registerLocalDirectorySession } from '@/lib/localSession';
+
+type AnalyzerMode = 'github' | 'local';
 
 export default function Home() {
+  const [mode, setMode] = useState<AnalyzerMode>('github');
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
   const [lang, setLang] = useState<'en' | 'zh'>('zh');
@@ -18,38 +37,56 @@ export default function Home() {
 
   const t = {
     en: {
-      title: 'GitHub Code Analyzer',
-      subtitle: "Visualize and explore any GitHub repository's structure and code instantly.",
+      title: 'Code Analyzer',
+      subtitle: 'Analyze GitHub repositories or your local project folder with the same workflow.',
+      githubTab: 'GitHub Project',
+      localTab: 'Local Project',
       placeholder: 'https://github.com/owner/repository',
       analyzeBtn: 'Analyze',
+      pickFolder: 'Choose Local Folder',
+      localHint: 'Browser support required: File System Access API.',
       errEmpty: 'Please enter a GitHub repository URL',
       errDomain: 'Please enter a valid github.com URL',
       errFormat: 'URL must include owner and repository name',
       errInvalid: 'Invalid URL format',
+      errFolderApi: 'This browser does not support local folder selection.',
+      errFolderPick: 'Failed to choose folder. Please try again.',
       historyTitle: 'Analysis History',
-      historyEmpty: 'No history yet. Analyze a repository to create one.',
+      historyEmpty: 'No history yet. Analyze a project to create one.',
       openHistory: 'Open Analysis',
       projectUrl: 'Project URL',
       language: 'Language',
+      delete: 'Delete',
+      localTag: 'Local',
+      githubTag: 'GitHub',
     },
     zh: {
-      title: 'GitHub 代码分析器',
-      subtitle: '可视化并探索任意 GitHub 仓库的结构与代码。',
+      title: '代码分析器',
+      subtitle: '以同一套流程分析 GitHub 项目或本地项目目录。',
+      githubTab: 'GitHub 项目',
+      localTab: '本地项目',
       placeholder: 'https://github.com/owner/repository',
       analyzeBtn: '分析',
+      pickFolder: '选择本地目录',
+      localHint: '需要浏览器支持 File System Access API。',
       errEmpty: '请输入 GitHub 仓库 URL',
       errDomain: '请输入有效的 github.com URL',
-      errFormat: 'URL 必须包含所有者和仓库名',
-      errInvalid: '无效的 URL 格式',
+      errFormat: 'URL 需要包含 owner 和 repository',
+      errInvalid: 'URL 格式无效',
+      errFolderApi: '当前浏览器不支持本地目录选择。',
+      errFolderPick: '选择目录失败，请重试。',
       historyTitle: '历史分析记录',
-      historyEmpty: '暂无历史记录，先分析一个仓库吧。',
+      historyEmpty: '暂无历史记录，先分析一个项目吧。',
       openHistory: '打开分析',
       projectUrl: '项目地址',
-      language: '编程语言',
-    }
+      language: '语言',
+      delete: '删除',
+      localTag: '本地',
+      githubTag: 'GitHub',
+    },
   };
 
-  const handleAnalyze = (e: React.FormEvent) => {
+  const handleAnalyzeGithub = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -70,23 +107,44 @@ export default function Home() {
         return;
       }
 
-      router.push(`/analyze?url=${encodeURIComponent(url)}&lang=${lang}`);
+      router.push(`/analyze?mode=github&url=${encodeURIComponent(url)}&lang=${lang}`);
     } catch {
       setError(t[lang].errInvalid);
     }
   };
 
+  const handlePickLocalFolder = async () => {
+    setError('');
+
+    try {
+      if (typeof window === 'undefined' || typeof (window as any).showDirectoryPicker !== 'function') {
+        setError(t[lang].errFolderApi);
+        return;
+      }
+
+      const handle = await (window as any).showDirectoryPicker();
+      const session = registerLocalDirectorySession(handle as FileSystemDirectoryHandle);
+      const localUrl = `local://${session.name}`;
+      router.push(
+        `/analyze?mode=local&sessionId=${encodeURIComponent(session.id)}&url=${encodeURIComponent(localUrl)}&lang=${lang}`
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.toLowerCase().includes('abort')) return;
+      setError(t[lang].errFolderPick);
+    }
+  };
+
   const openHistoryRecord = (record: AnalysisHistoryRecord) => {
+    const recordMode = record.repoInfo?.kind === 'local' ? 'local' : 'github';
     router.push(
-      `/analyze?historyId=${encodeURIComponent(record.id)}&url=${encodeURIComponent(record.projectUrl)}&lang=${lang}`
+      `/analyze?historyId=${encodeURIComponent(record.id)}&mode=${recordMode}&url=${encodeURIComponent(record.projectUrl)}&lang=${lang}`
     );
   };
 
   const deleteHistoryRecord = (e: React.MouseEvent, record: AnalysisHistoryRecord) => {
     e.stopPropagation();
-    const confirmed = window.confirm(
-      lang === 'en' ? 'Delete this history record?' : '确定删除这条历史记录吗？'
-    );
+    const confirmed = window.confirm(lang === 'en' ? 'Delete this history record?' : '确定删除这条历史记录吗？');
     if (!confirmed) return;
     removeAnalysisHistoryRecord(record.id);
   };
@@ -104,42 +162,83 @@ export default function Home() {
       <div className="max-w-4xl w-full space-y-8 text-center">
         <div className="flex flex-col items-center justify-center space-y-4">
           <div className="bg-indigo-600 p-4 rounded-2xl shadow-lg shadow-indigo-200">
-            <Github className="w-12 h-12 text-white" />
+            {mode === 'github' ? (
+              <Github className="w-12 h-12 text-white" />
+            ) : (
+              <FolderSearch className="w-12 h-12 text-white" />
+            )}
           </div>
-          <h1 className="text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl">
-            {t[lang].title}
-          </h1>
-          <p className="text-lg text-slate-600 max-w-xl mx-auto">
-            {t[lang].subtitle}
-          </p>
+          <h1 className="text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl">{t[lang].title}</h1>
+          <p className="text-lg text-slate-600 max-w-xl mx-auto">{t[lang].subtitle}</p>
         </div>
 
-        <form onSubmit={handleAnalyze} className="mt-8 max-w-xl mx-auto w-full">
-          <div className="relative flex items-center">
-            <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-              <Search className="h-5 w-5 text-slate-400" />
+        <div className="max-w-xl mx-auto w-full bg-white border border-slate-200 rounded-xl p-1 grid grid-cols-2 gap-1 shadow-sm">
+          <button
+            type="button"
+            onClick={() => {
+              setMode('github');
+              setError('');
+            }}
+            className={`h-10 rounded-lg text-sm font-medium transition-colors ${
+              mode === 'github' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            {t[lang].githubTab}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMode('local');
+              setError('');
+            }}
+            className={`h-10 rounded-lg text-sm font-medium transition-colors ${
+              mode === 'local' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            {t[lang].localTab}
+          </button>
+        </div>
+
+        {mode === 'github' ? (
+          <form onSubmit={handleAnalyzeGithub} className="mt-8 max-w-xl mx-auto w-full">
+            <div className="relative flex items-center">
+              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                <Search className="h-5 w-5 text-slate-400" />
+              </div>
+              <input
+                type="text"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="block w-full pl-11 pr-32 py-4 text-base rounded-xl border-slate-200 shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                placeholder={t[lang].placeholder}
+              />
+              <button
+                type="submit"
+                className="absolute right-2 top-2 bottom-2 px-6 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+              >
+                {t[lang].analyzeBtn}
+              </button>
             </div>
-            <input
-              type="text"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              className="block w-full pl-11 pr-32 py-4 text-base rounded-xl border-slate-200 shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
-              placeholder={t[lang].placeholder}
-            />
+          </form>
+        ) : (
+          <div className="mt-8 max-w-xl mx-auto w-full">
             <button
-              type="submit"
-              className="absolute right-2 top-2 bottom-2 px-6 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+              type="button"
+              onClick={handlePickLocalFolder}
+              className="w-full h-14 px-6 bg-indigo-600 text-white font-medium rounded-xl hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors shadow-sm"
             >
-              {t[lang].analyzeBtn}
+              {t[lang].pickFolder}
             </button>
+            <div className="mt-3 text-xs text-slate-500">{t[lang].localHint}</div>
           </div>
-          {error && (
-            <div className="mt-3 flex items-center justify-center text-red-500 text-sm">
-              <AlertCircle className="w-4 h-4 mr-1.5" />
-              {error}
-            </div>
-          )}
-        </form>
+        )}
+
+        {error && (
+          <div className="mt-3 flex items-center justify-center text-red-500 text-sm">
+            <AlertCircle className="w-4 h-4 mr-1.5" />
+            {error}
+          </div>
+        )}
 
         <section className="max-w-4xl mx-auto w-full mt-8 text-left">
           <div className="flex items-center mb-4">
@@ -155,9 +254,9 @@ export default function Home() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {historyRecords.map((record) => {
                 const primaryLanguage =
-                  record.aiAnalysis?.primaryLanguage_zh ||
-                  record.aiAnalysis?.primaryLanguage_en ||
-                  'N/A';
+                  record.aiAnalysis?.primaryLanguage_zh || record.aiAnalysis?.primaryLanguage_en || 'N/A';
+                const recordMode = record.repoInfo?.kind === 'local' ? 'local' : 'github';
+                const modeLabel = recordMode === 'local' ? t[lang].localTag : t[lang].githubTag;
 
                 return (
                   <div
@@ -168,18 +267,25 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={(e) => deleteHistoryRecord(e, record)}
-                      title={lang === 'en' ? 'Delete' : '删除'}
-                      aria-label={lang === 'en' ? 'Delete history' : '删除历史记录'}
+                      title={t[lang].delete}
+                      aria-label={t[lang].delete}
                       className="absolute top-3 right-3 p-1.5 rounded-md text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
-                    <div className="font-semibold text-slate-900 truncate mb-1">{record.projectName}</div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="font-semibold text-slate-900 truncate">{record.projectName}</div>
+                      <span className="inline-flex px-2 py-0.5 text-[10px] rounded-full bg-slate-100 text-slate-600 border border-slate-200">
+                        {modeLabel}
+                      </span>
+                    </div>
                     <div className="text-xs text-slate-500 break-all mb-3">
                       {t[lang].projectUrl}: {record.projectUrl}
                     </div>
                     <div className="flex items-center justify-between gap-3 text-xs text-slate-600">
-                      <span>{t[lang].language}: {primaryLanguage}</span>
+                      <span>
+                        {t[lang].language}: {primaryLanguage}
+                      </span>
                       <span className="inline-flex items-center text-slate-500">
                         <Clock3 className="w-3.5 h-3.5 mr-1" />
                         {new Date(record.savedAt).toLocaleString()}
@@ -196,3 +302,4 @@ export default function Home() {
     </div>
   );
 }
+

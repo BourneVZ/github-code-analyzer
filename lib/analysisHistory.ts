@@ -45,9 +45,11 @@ export type StoredFunctionModule = {
 };
 
 export type RepoInfoSnapshot = {
-  owner: string;
-  repo: string;
-  branch: string;
+  kind?: 'github' | 'local';
+  owner?: string;
+  repo?: string;
+  branch?: string;
+  name?: string;
 };
 
 export type AiAnalysisSnapshot = {
@@ -109,7 +111,7 @@ const safeParse = (raw: string | null): AnalysisHistoryRecord[] => {
 };
 
 export const buildHistoryId = (repoInfo: RepoInfoSnapshot | null, projectUrl: string) => {
-  if (repoInfo) {
+  if (repoInfo?.owner && repoInfo?.repo && repoInfo?.branch) {
     return `${repoInfo.owner}/${repoInfo.repo}#${repoInfo.branch}`.toLowerCase();
   }
   return projectUrl.trim().toLowerCase();
