@@ -29,6 +29,17 @@ type LogEntry = {
 type RepoRef = { owner: string; repo: string; branch: string; kind?: 'github' | 'local'; name?: string };
 type GithubEndpointKind = 'api' | 'raw';
 
+const toRepoRef = (repoInfo: RepoInfoSnapshot | null): RepoRef | null => {
+  if (!repoInfo) return null;
+  return {
+    owner: repoInfo.owner || 'local',
+    repo: repoInfo.repo || repoInfo.name || 'local',
+    branch: repoInfo.branch || 'local',
+    kind: repoInfo.kind,
+    name: repoInfo.name,
+  };
+};
+
 class GithubRequestError extends Error {
   details: Record<string, any>;
 
@@ -510,7 +521,7 @@ function AnalyzeContent() {
     owner?: string;
     repo?: string;
     branch?: string;
-  }) => {
+  }): Promise<never> => {
     const bodyText = await res.text().catch(() => '');
     const details = {
       endpoint: context.endpoint,
@@ -551,7 +562,7 @@ function AnalyzeContent() {
       repo?: string;
       branch?: string;
     }
-  ) => {
+  ): never => {
     const errObj = err as any;
     const details = {
       endpoint: context.endpoint,
@@ -580,12 +591,12 @@ function AnalyzeContent() {
     try {
       const res = await fetch(url, { headers: getGithubApiHeaders() });
       if (!res.ok) {
-        await buildGithubErrorFromResponse(res, { endpoint: 'api', operation, url });
+        return await buildGithubErrorFromResponse(res, { endpoint: 'api', operation, url });
       }
       return res.json() as Promise<T>;
     } catch (err) {
       if (err instanceof GithubRequestError) throw err;
-      buildGithubErrorFromException(err, { endpoint: 'api', operation, url });
+      throw buildGithubErrorFromException(err, { endpoint: 'api', operation, url });
     }
   };
 
@@ -2727,7 +2738,12 @@ Determine if this file is the main entry point. Provide your reasoning.`;
       }
     }
   };
-  const analyzeWithAI = async (filePaths: string[], currentFetchId: number, repo: {owner: string, repo: string, branch: string}, targetUrl: string) => {
+  const analyzeWithAI = async (
+    filePaths: string[],
+    currentFetchId: number,
+    repo: RepoRef,
+    targetUrl: string
+  ) => {
     if (currentFetchId !== fetchIdRef.current) return;
     setIsAnalyzing(true);
     setAiAnalysis(null);
@@ -3193,9 +3209,10 @@ Determine if this file is the main entry point. Provide your reasoning.`;
     setSelectedLine(targetLine ?? null);
 
     try {
-      if (!repoInfo) throw new Error('Repository info missing');
+      const repoRef = toRepoRef(repoInfo);
+      if (!repoRef) throw new Error('Repository info missing');
 
-      const contentResult = await fetchFileText(repoInfo, node.path);
+      const contentResult = await fetchFileText(repoRef, node.path);
       if (!contentResult) {
         throw new Error('Failed to fetch file content');
       }
@@ -3217,7 +3234,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
   };
 
   const handleOpenPanoramaNodeSource = async (node: { name: string; file: string; lineStart?: number; lineEnd?: number }) => {
-    if (!repoInfo) return;
+    const repoRef = toRepoRef(repoInfo);
+    if (!repoRef) return;
     setShowFileTree(true);
     setShowCodeViewer(true);
 
@@ -3234,7 +3252,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             functionName: node.name,
             parentFile: resolvedFile || confirmedEntryFile?.path || '',
             allFiles: allFilePaths,
-            repo: repoInfo,
+            repo: repoRef,
             ai,
             currentFetchId: fetchIdRef.current,
           });
@@ -3268,7 +3286,8 @@ Determine if this file is the main entry point. Provide your reasoning.`;
 
   const handleManualPanoramaDrillDown = async (node: { id: string; name: string; file: string; depth?: number; drillDown?: number }) => {
     if (manualDrilldownNodeId) return;
-    if (!repoInfo) {
+    const repoRef = toRepoRef(repoInfo);
+    if (!repoRef) {
       addLog(
         { en: 'Cannot continue drill-down: repository info missing.', zh: '无法继续下钻：缺少仓库信息。' },
         'warning'
@@ -3329,7 +3348,7 @@ Determine if this file is the main entry point. Provide your reasoning.`;
             functionName: target.name,
             parentFile,
             allFiles,
-            repo: repoInfo,
+            repo: repoRef,
             ai,
             currentFetchId: fetchIdRef.current,
           });

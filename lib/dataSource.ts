@@ -210,7 +210,8 @@ export const createLocalDataSource = (sessionId: string): CodeDataSource => {
   let cachedSnapshot: DataSourceSnapshot | null = null;
 
   const walkDirectory = async (dir: FileSystemDirectoryHandle, prefix = '', nodes: GithubNode[] = []) => {
-    for await (const [entryName, entry] of dir.entries()) {
+    for await (const entry of (dir as any).values() as AsyncIterable<FileSystemHandle>) {
+      const entryName = entry.name;
       const path = prefix ? `${prefix}/${entryName}` : entryName;
       if (entry.kind === 'directory') {
         nodes.push({
@@ -220,10 +221,11 @@ export const createLocalDataSource = (sessionId: string): CodeDataSource => {
           sha: `local-tree-${path}`,
           url: `local://${encodeURIComponent(path)}`,
         });
-        await walkDirectory(entry, path, nodes);
+        await walkDirectory(entry as FileSystemDirectoryHandle, path, nodes);
       } else {
-        const file = await entry.getFile();
-        fileHandleMap.set(path, entry);
+        const fileHandle = entry as FileSystemFileHandle;
+        const file = await fileHandle.getFile();
+        fileHandleMap.set(path, fileHandle);
         nodes.push({
           path,
           mode: '100644',
