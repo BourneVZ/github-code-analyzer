@@ -3974,7 +3974,7 @@ For each child function return:
 
           {showFileTree && (
             <>
-              <Separator className="w-1 bg-slate-200 hover:bg-indigo-400 transition-colors cursor-col-resize" />
+              <Separator className="w-1 bg-slate-300 hover:bg-slate-400 transition-colors cursor-col-resize" />
               {/* Middle Panel - File Tree */}
               <Panel defaultSize={15} minSize={10}>
                 <div className="h-full border-r border-slate-200 bg-white flex flex-col">
@@ -4001,7 +4001,7 @@ For each child function return:
 
           {showCodeViewer && (
             <>
-              <Separator className="w-1 bg-slate-200 hover:bg-indigo-400 transition-colors cursor-col-resize" />
+              <Separator className="w-1 bg-slate-300 hover:bg-slate-400 transition-colors cursor-col-resize" />
               {/* Code Viewer */}
               <Panel defaultSize={30} minSize={15}>
                 <div className="h-full bg-slate-50 p-4 overflow-hidden flex flex-col border-r border-slate-200">
@@ -4031,7 +4031,7 @@ For each child function return:
 
           {showPanorama && (
             <>
-              <Separator className="w-1 bg-slate-200 hover:bg-indigo-400 transition-colors cursor-col-resize" />
+              <Separator className="w-1 bg-slate-300 hover:bg-slate-400 transition-colors cursor-col-resize" />
               {/* Panorama */}
               <Panel defaultSize={30} minSize={15}>
                 <div className="h-full bg-slate-50 flex flex-col">

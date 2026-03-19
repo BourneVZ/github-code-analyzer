@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow,
   Controls,
@@ -11,9 +11,12 @@ import {
   Node,
   Edge,
   NodeMouseHandler,
+  getNodesBounds,
+  getViewportForBounds,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Search, HelpCircle, XCircle, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+import { Search, HelpCircle, XCircle, ChevronDown, ChevronUp, Loader2, Download } from 'lucide-react';
+import { toPng } from 'html-to-image';
 
 const rootId = 'root';
 
@@ -145,6 +148,8 @@ export function Panorama({
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(new Set());
+  const [isExporting, setIsExporting] = useState(false);
+  const flowWrapperRef = useRef<HTMLDivElement | null>(null);
 
   const childrenMap = useMemo(() => {
     const map = new Map<string, PanoramaNode[]>();
@@ -343,8 +348,87 @@ export function Panorama({
   ]);
 
   return (
-    <div className="w-full h-full bg-slate-50/50 relative">
+    <div className="w-full h-full bg-slate-50/50 relative" ref={flowWrapperRef}>
       <div className="absolute top-3 right-3 z-20 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={async () => {
+            if (isExporting) return;
+            if (!flowWrapperRef.current) return;
+            const target = flowWrapperRef.current.querySelector('.react-flow__viewport') as HTMLElement | null;
+            if (!target) return;
+
+            try {
+              setIsExporting(true);
+              // Export all currently visible (not collapsed) nodes by fitting bounds,
+              // instead of exporting the current camera viewport.
+              const measurableNodes = nodes.map((node) => ({
+                ...node,
+                width: node.width ?? 250,
+                height: node.height ?? 140,
+              }));
+              const bounds = getNodesBounds(measurableNodes);
+              const padding = 120;
+              const rawWidth = Math.max(Math.ceil(bounds.width + padding * 2), 1200);
+              const rawHeight = Math.max(Math.ceil(bounds.height + padding * 2), 900);
+              const imageWidth = Math.min(rawWidth, 6000);
+              const imageHeight = Math.min(rawHeight, 6000);
+              const exportBounds = {
+                x: bounds.x - padding,
+                y: bounds.y - padding,
+                width: bounds.width + padding * 2,
+                height: bounds.height + padding * 2,
+              };
+
+              const viewport = getViewportForBounds(
+                exportBounds,
+                imageWidth,
+                imageHeight,
+                0.01,
+                2,
+                0
+              );
+
+              // Dynamic clarity strategy:
+              // - fewer nodes => higher ratio
+              // - many nodes => slightly lower ratio to avoid huge memory spikes
+              const basePixelRatio =
+                nodes.length <= 30 ? 3.5 :
+                nodes.length <= 80 ? 3 :
+                nodes.length <= 160 ? 2.4 : 2;
+              const maxPixels = 42_000_000;
+              const maxRatioByPixels = Math.sqrt(maxPixels / Math.max(1, imageWidth * imageHeight));
+              const pixelRatio = Math.max(1, Math.min(4, Math.min(basePixelRatio, maxRatioByPixels)));
+
+              const dataUrl = await toPng(target, {
+                cacheBust: true,
+                pixelRatio,
+                width: imageWidth,
+                height: imageHeight,
+                backgroundColor: '#f8fafc',
+                style: {
+                  width: `${imageWidth}px`,
+                  height: `${imageHeight}px`,
+                  transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`,
+                  transformOrigin: '0 0',
+                },
+              });
+              const link = document.createElement('a');
+              link.download = `function-panorama-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+              link.href = dataUrl;
+              link.click();
+            } catch (err) {
+              console.error('Failed to export panorama image:', err);
+            } finally {
+              setIsExporting(false);
+            }
+          }}
+          disabled={isExporting || nodes.length === 0}
+          className="h-8 px-3 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 text-xs font-medium shadow-sm disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center"
+        >
+          {isExporting ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : <Download className="w-3.5 h-3.5 mr-1.5" />}
+          {lang === 'en' ? 'Export PNG' : '导出 PNG'}
+        </button>
         <button
           type="button"
           onClick={() => setCollapsedNodeIds(new Set())}
@@ -385,4 +469,6 @@ export function Panorama({
     </div>
   );
 }
+
+
 
